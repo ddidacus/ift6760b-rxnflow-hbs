@@ -1,6 +1,26 @@
-> This checkout adds **RxnFlow-HBS** on top of upstream RxnFlow: see
-> [`RXNFLOW_HBS.md`](RXNFLOW_HBS.md) for how to run both variants, and
-> [`SETUP.md`](SETUP.md) / [`RESULTS_26_11_18.md`](RESULTS_26_11_18.md) for the details.
+# RxnFlow-HBS
+
+A fork of upstream RxnFlow for the IFT6760B project. Nothing under `src/` is modified:
+everything added lives in `hbs/` and reaches RxnFlow by subclassing `RxnFlowPolicy` and
+`RxnFlowTrainer`, so the baseline arm runs upstream code exactly as cloned.
+
+What is implemented so far is **HBS** — hierarchical binary search over the
+building-block space, in place of upstream's uniform action subsampling:
+
+- Every building block is hashed once, at the start of a run, in *fixed* feature space
+  (the fingerprints precomputed when the environment was prepared, L2-normalized), so
+  the index never goes stale and is never rebuilt.
+- An action is scored by hashing its query into that same space and taking inner
+  products against the rows of the bucket the query falls in. The bucket *is* the
+  candidate set, so there is no `K` and no `log(N/K)` partition correction.
+- Learning stays on the query side: upstream's action heads are kept as they are, plus
+  one `Linear(synthon_dim -> feature_dim)` projecting their output into the fixed space.
+- A roshambo2 shape/colour reward (CDK8 by default) and per-trajectory diversity and
+  latency metrics are shared by both arms.
+
+The upstream README follows.
+
+---
 
 # RxnFlow: Synthesis-aware drug design with GFlowNets
 
