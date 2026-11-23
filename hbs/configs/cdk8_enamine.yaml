@@ -1,0 +1,29 @@
+# RxnFlow on the CDK8 roshambo2 target over the prepared Enamine catalog.
+# Identical to cdk8.yaml except for env_dir, so a pair of runs here is comparable
+# with the example_5k pair and with each other. Used by both arms.
+#
+# The catalog was prepared earlier, outside this package, with RxnFlow 2.1.1 --
+# the version vendored here -- so it loads without regeneration:
+#   388 libraries, 482,070 synthons, 289,822 building blocks.
+env_dir: ./data/envs/enamine_290k/
+
+reward:
+  beta: "32"
+  settings:
+    target: cdk8
+    num_confs: 25
+    num_isomers: 2
+    # n_jobs is left to ROSHAMBO_NUM_CPUS; see hbs/sbatch/train_cdk8.sh.
+
+# The same ratio as cdk8.yaml, but it bites far harder on this catalog: 255 of
+# 388 libraries are subsampled and 55,314 of 482,070 candidate actions are scored
+# per state (11.5%), against 1,652 of 5,864 (28%) on example_5k. The largest
+# library holds 92,813 synthons, so K there is 9,281. This is the setting where
+# candidate selection matters most -- and the reason a step costs much more here.
+subsampling:
+  sampling_ratio: 0.1
+  min_sampling: 50
+  importance_temp: 1.0
+
+property_penalty:
+  mw: 500

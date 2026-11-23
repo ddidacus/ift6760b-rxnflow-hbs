@@ -1,3 +1,7 @@
+> This checkout adds **RxnFlow-HBS** on top of upstream RxnFlow: see
+> [`RXNFLOW_HBS.md`](RXNFLOW_HBS.md) for how to run both variants, and
+> [`SETUP.md`](SETUP.md) / [`RESULTS_26_11_18.md`](RESULTS_26_11_18.md) for the details.
+
 # RxnFlow: Synthesis-aware drug design with GFlowNets
 
 <img src="image/overview.png" alt="RxnFlow synthesis pathway overview" width="600">

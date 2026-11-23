@@ -21,3 +21,10 @@ dist/
 htmlcov/
 coverage.xml
 *.log
+runs/
+logs/
+data/envs/
+data/catalogs/
+
+# Agent
+.claude

@@ -1,0 +1,30 @@
+# RxnFlow on the CDK8 roshambo2 target: 3D shape-and-colour similarity to
+# support/queries/CDK8_insilico.sdf. Used by both arms -- uniform action
+# subsampling and hierarchical binary search -- so the two runs share every
+# setting below and differ only in --hbs.
+env_dir: ./data/envs/example_5k/
+
+reward:
+  # Reward exponent. 32 is the shipped single-objective default (configs/qed.yaml)
+  # and roshambo2 Tanimoto scores live on the same [0, 1] scale as QED.
+  beta: "32"
+  settings:
+    target: cdk8
+    num_confs: 25
+    num_isomers: 2
+    # n_jobs is left to ROSHAMBO_NUM_CPUS so the conformer pool matches the
+    # cores the job was actually allocated; see hbs/sbatch/train_cdk8.sh.
+
+# Template defaults, deliberately not configs/qed.yaml's ratio of 0.2: on this
+# catalog (45 libraries, 5,864 synthons) they subsample 20 libraries holding
+# 5,343 synthons, so 1,652 of 5,864 candidate actions are scored per state. That
+# is the mechanism the HBS arm replaces, so it has to be doing something.
+subsampling:
+  sampling_ratio: 0.1
+  min_sampling: 50
+  importance_temp: 1.0
+
+# As configs/qed.yaml: keep generations in a drug-like weight range. The CDK8
+# query is 27 heavy atoms.
+property_penalty:
+  mw: 500
