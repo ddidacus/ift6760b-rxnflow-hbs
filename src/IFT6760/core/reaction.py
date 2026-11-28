@@ -1,0 +1,273 @@
+# Source: src/rxnflow/core/reaction.py
+"""RDKit forward and reverse reactions over synthon molecules."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+from rdkit import Chem, rdBase
+from rdkit.Chem.rdChemReactions import (
+    ChemicalReaction,
+    ReactionFromSmarts,
+    ReactionToSmarts,
+)
+
+from .molecule import Molecule
+
+
+def _compile(smarts: str) -> ChemicalReaction:
+    reaction = ReactionFromSmarts(smarts)
+    if reaction is None:
+        raise ValueError(f"invalid reaction SMARTS: {smarts}")
+    reaction.Initialize()
+    return reaction
+
+
+def _invert(smarts: str) -> str:
+    """The exact inverse of a template: its products become its reactants.
+
+    The curated reverse template carries retrosynthetic judgement and can be strictly
+    more restrictive than the forward one, which lets the forward policy build a
+    molecule whose generating step the reverse template refuses to propose. The
+    inverse cannot miss such a step, because its left-hand side *is* the forward
+    template's right-hand side. Over-proposal costs nothing: every candidate is still
+    confirmed by running the reaction forward.
+    """
+    lhs, separator, rhs = smarts.partition(">>")
+    if not (separator and lhs and rhs):
+        raise ValueError(f"reaction SMARTS is not invertible: {smarts!r}")
+    return f"{rhs}>>{lhs}"
+
+
+def _typed_sites(pattern: Chem.Mol) -> tuple[int, ...]:
+    """Read typed handles without treating mapped wildcards as synthesis sites."""
+    return tuple(
+        atom.GetIsotope()
+        for atom in pattern.GetAtoms()
+        if atom.GetAtomicNum() == 0 and atom.GetIsotope() > 0
+    )
+
+
+def _run(
+    reaction: ChemicalReaction, reactants: tuple[Molecule, ...]
+) -> list[tuple[Molecule, ...]]:
+    assert len(reactants) == reaction.GetNumReactantTemplates()
+    products: dict[tuple[str, ...], tuple[Molecule, ...]] = {}
+    # Canonical SMILES deduplicate and order products; retain molecules for
+    # structural checks and reuse the same SMILES in reverse route enumeration.
+    reactant_rdmols = [m.rdmol for m in reactants]
+    for product_set in reaction.RunReactants(reactant_rdmols, 0):
+        if len(product_set) != reaction.GetNumProductTemplates():
+            continue
+        molecules: list[Molecule] = []
+        keys: list[str] = []
+        for product in product_set:
+            try:
+                # Discard invalid products and suppress their RDKit diagnostics.
+                with rdBase.BlockLogs():
+                    Chem.SanitizeMol(product)
+                    product = Chem.RemoveHs(product)
+                    key = Chem.MolToSmiles(product)
+            except (ValueError, RuntimeError, Chem.rdchem.KekulizeException):
+                break
+            molecules.append(Molecule(smiles=key, rdmol=product))
+            keys.append(key)
+        if len(molecules) == len(product_set):
+            products.setdefault(tuple(keys), tuple(molecules))
+    return [products[key] for key in sorted(products)]
+
+
+class Reaction:
+    """Compiled forward/reverse SMARTS with sanitized, deduplicated products."""
+
+    def __init__(self, name: str, forward: str, reverse: str) -> None:
+        self.name = name
+        self.forward_template = forward
+        self.reverse_template = reverse
+        self.inverse_template = _invert(forward)
+        self.forward_reaction = _compile(forward)
+        self.reverse_reaction = _compile(reverse)
+        # Complete by construction: used where a missing proposal would be a bug.
+        self.inverse_reaction = _compile(self.inverse_template)
+
+    def run_forward(self, *reactants: Molecule) -> Molecule | None:
+        """Return the unique connected product, or None for an infeasible match.
+
+        Incoming synthon orientation fixes the attachment site. Symmetry-related
+        matches are deduplicated by _run; distinct products indicate a template
+        ambiguity and must not be resolved by silently picking the first one.
+        """
+        products = [
+            product_set[0]
+            for product_set in _run(self.forward_reaction, tuple(reactants))
+            if len(product_set) == 1 and len(Chem.GetMolFrags(product_set[0].rdmol)) == 1
+        ]
+        if len(products) > 1:
+            raise ValueError(
+                f"reaction {self.name} produced {len(products)} distinct forward products"
+            )
+        return products[0] if products else None
+
+    def run_inverse(self, product: Molecule) -> list[tuple[Molecule, ...]]:
+        """Every precursor set the *forward* template could have produced `product` from.
+
+        Unlike `run_reverse` this cannot omit a precursor set the forward template
+        would accept, which is what makes the one-step candidate set complete.
+        """
+        return _run(self.inverse_reaction, (product,))
+
+    def run_reverse(self, product: Molecule) -> list[tuple[Molecule, ...]]:
+        """Return all precursor sets with their canonical SMILES in sorted order."""
+        # _run already enumerates and deduplicates every RDKit match. Truncating
+        # here can discard the only decomposition whose synthon is in the catalog.
+        return _run(self.reverse_reaction, (product,))
+
+
+class UniReaction(Reaction):
+    """Transform one typed handle; output_type=None consumes it and terminates."""
+
+    def __init__(
+        self,
+        name: str,
+        forward: str,
+        reverse: str,
+    ) -> None:
+        super().__init__(name, forward, reverse)
+        if (
+            self.forward_reaction.GetNumReactantTemplates() != 1
+            or self.forward_reaction.GetNumProductTemplates() != 1
+            or self.reverse_reaction.GetNumReactantTemplates() != 1
+            or self.reverse_reaction.GetNumProductTemplates() != 1
+        ):
+            raise ValueError(f"invalid unimolecular reaction shape: {self.name}")
+        inputs = _typed_sites(self.forward_reaction.GetReactantTemplate(0))
+        outputs = _typed_sites(self.forward_reaction.GetProductTemplate(0))
+        if (
+            len(inputs) != 1
+            or len(outputs) > 1
+            or _typed_sites(self.reverse_reaction.GetReactantTemplate(0)) != outputs
+            or _typed_sites(self.reverse_reaction.GetProductTemplate(0)) != inputs
+        ):
+            raise ValueError(f"invalid unimolecular SMARTS sites: {self.name}")
+        self.input_type = inputs[0]
+        self.output_type = outputs[0] if outputs else None
+
+
+class BiReaction(Reaction):
+    """A bimolecular template oriented as (state, incoming synthon).
+
+    Input types are inferred in the original forward SMARTS reactant order.
+    The incoming synthon's unique isotope-0 dummy fixes its attachment site.
+    Its chemical type is carried by the library key and ``attachment_type``. The
+    reverse template recreates that marker so catalog lookup preserves direction.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        forward: str,
+        reverse: str,
+        synthon_first: bool = False,
+    ) -> None:
+        super().__init__(name, forward, reverse)
+        self.synthon_first = synthon_first
+        if (
+            self.forward_reaction.GetNumReactantTemplates() != 2
+            or self.forward_reaction.GetNumProductTemplates() != 1
+            or self.reverse_reaction.GetNumReactantTemplates() != 1
+            or self.reverse_reaction.GetNumProductTemplates() != 2
+        ):
+            raise ValueError(f"invalid bimolecular reaction shape: {self.name}")
+        # Infer before the incoming handle loses its chemical type to isotope 0.
+        inputs = tuple(
+            _typed_sites(self.forward_reaction.GetReactantTemplate(i)) for i in (0, 1)
+        )
+        if (
+            any(len(sites) != 1 for sites in inputs)
+            or _typed_sites(self.forward_reaction.GetProductTemplate(0))
+            or _typed_sites(self.reverse_reaction.GetReactantTemplate(0))
+            or any(
+                _typed_sites(self.reverse_reaction.GetProductTemplate(i)) != inputs[i]
+                for i in (0, 1)
+            )
+        ):
+            raise ValueError(f"invalid bimolecular SMARTS sites: {self.name}")
+        self.input_types = (inputs[0][0], inputs[1][0])
+
+        # Reorder both directions into (state, synthon), then change the synthon's
+        # attachment query to isotope 0 while retaining the state's typed query.
+        state_position, synthon_position = (1, 0) if self.synthon_first else (0, 1)
+        forward = ChemicalReaction()
+        reverse = ChemicalReaction()
+        for position in (state_position, synthon_position):
+            reactant = Chem.Mol(self.forward_reaction.GetReactantTemplate(position))
+            product = Chem.Mol(self.reverse_reaction.GetProductTemplate(position))
+            if position == synthon_position:
+                for atom in reactant.GetAtoms():
+                    if atom.GetAtomicNum() == 0 and atom.GetIsotope() > 0:
+                        # [0#0] matches only the attachment marker, not a typed
+                        # dummy at the other end (nor an ordinary element).
+                        atom.SetQuery(Chem.AtomFromSmarts("[0#0]"))
+                for atom in product.GetAtoms():
+                    if atom.GetAtomicNum() == 0 and atom.GetIsotope() > 0:
+                        atom.SetQuery(Chem.AtomFromSmarts("[0#0]"))
+                        atom.SetIsotope(0)
+            forward.AddReactantTemplate(reactant)
+            reverse.AddProductTemplate(product)
+        forward.AddProductTemplate(self.forward_reaction.GetProductTemplate(0))
+        reverse.AddReactantTemplate(self.reverse_reaction.GetReactantTemplate(0))
+        # Compile independent templates after editing their queries/order.
+        self.forward_reaction = _compile(ReactionToSmarts(forward))
+        self.reverse_reaction = _compile(ReactionToSmarts(reverse))
+        # The inverse must mirror the *rewritten* forward template: reordered to
+        # (state, synthon) and with the synthon's attachment marker at isotope 0,
+        # which is what the catalog lookup in `_reverse_birxn` expects.
+        self.inverse_template = _invert(ReactionToSmarts(self.forward_reaction))
+        self.inverse_reaction = _compile(self.inverse_template)
+
+    @property
+    def state_type(self) -> int:
+        return self.input_types[int(self.synthon_first)]
+
+    @property
+    def attachment_type(self) -> int:
+        return self.input_types[int(not self.synthon_first)]
+
+
+def load_reactions(path: Path) -> tuple[dict[str, UniReaction], dict[str, BiReaction]]:
+    """Compile the named unimolecular reactions and permitted bimolecular orientations."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    # Validate template sections and names.
+    if not isinstance(raw, dict) or set(raw) != {"UniReaction", "BiReaction"}:
+        raise ValueError(
+            "reaction.yaml requires only UniReaction and BiReaction sections"
+        )
+    # ParameterDict uses reaction names as keys; dots separate module paths.
+    for section in ("UniReaction", "BiReaction"):
+        for name in raw[section]:
+            if "." in name:
+                raise ValueError(f"reaction name must not contain '.': {name}")
+
+    # Compile unimolecular reactions.
+    uni: dict[str, UniReaction] = {}
+    for name, spec in raw["UniReaction"].items():
+        uni[name] = UniReaction(name, spec["forward"], spec["reverse"])
+
+    # Compile the permitted state/synthon orientations for bimolecular reactions.
+    bi: dict[str, BiReaction] = {}
+    for name, spec in raw["BiReaction"].items():
+        shared = {
+            "forward": spec["forward"],
+            "reverse": spec["reverse"],
+        }
+        if spec["ordered"]:
+            # r1/r2 place the state in the first/second original SMARTS position.
+            bi[f"{name}_r1"] = BiReaction(f"{name}_r1", **shared, synthon_first=False)
+            bi[f"{name}_r2"] = BiReaction(f"{name}_r2", **shared, synthon_first=True)
+        else:
+            # Keep one orientation and the original name; the state comes first.
+            bi[name] = BiReaction(name, **shared)
+
+    return uni, bi

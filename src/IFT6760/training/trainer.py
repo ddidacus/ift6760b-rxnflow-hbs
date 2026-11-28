@@ -1,0 +1,611 @@
+# Source: src/rxnflow/trainer.py
+"""Local trajectory-balance training with replay, EMA, and restart."""
+
+from __future__ import annotations
+
+import json
+import logging
+import shutil
+from pathlib import Path
+from time import perf_counter
+
+import numpy as np
+import torch
+from omegaconf import OmegaConf
+
+from IFT6760 import __version__
+from IFT6760.__version__ import (
+    check_library_compatibility,
+    check_model_compatibility,
+)
+from IFT6760.core.types import Trajectory
+from IFT6760.envs.env import SynthesisEnv
+from IFT6760.models import RxnFlowModel
+from IFT6760.objectives.backward import BackwardObjective
+from IFT6760.objectives.trajectory_balance import TrajectoryBalance, scalarize_log_rewards
+from IFT6760.policies.backward import BackwardPolicy
+from IFT6760.policies.policy import RxnFlowPolicy
+from IFT6760.rewards.property_penalty import compute_property_rewards
+from IFT6760.rewards.reward import RewardFunction
+from IFT6760.sampling.condition_sampler import ConditionSampler
+from IFT6760.sampling.conditioning import ConditioningModule
+from IFT6760.sampling.replay import ReplayBuffer
+from IFT6760.training.config import Config
+
+logger = logging.getLogger(__name__)
+
+
+def init_logger(log_path: Path) -> None:
+    """Configure the logger to write to both console and file."""
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    # File handler
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+
+class RxnFlowTrainer:
+    def __init__(
+        self,
+        config: Config,
+        reward: RewardFunction,
+        *,
+        seed: int = 1,
+        output_dir: str | Path,
+        device: str | torch.device = "cuda",
+        num_workers: int = 4,
+        conditioning: ConditioningModule | None = None,
+    ):
+        # Validate the configuration
+        config.validate()
+        if num_workers < 0:
+            raise ValueError("num_workers must be non-negative")
+        self.config: Config = config
+        self.num_workers = num_workers
+
+        # Set up the output directory
+        self.output_dir = Path(output_dir)
+        if self.output_dir.exists():
+            raise FileExistsError(f"output directory already exists: {self.output_dir}")
+        self.output_dir.mkdir(parents=True)
+        self.config.save(self.output_dir / "config.yaml")
+        self.checkpoint_dir = self.output_dir / "checkpoints"
+        self.checkpoint_dir.mkdir()
+        self.sample_path = self.output_dir / "sample.jsonl"
+        self.log_file = self.output_dir / "training.log"
+        init_logger(self.log_file)
+
+        self.device: torch.device = torch.device(device)
+        self.seed: int = seed
+        torch.manual_seed(seed)
+        self.rng = np.random.default_rng(seed)
+
+        logger.info(
+            "Initializing trainer: device=%s, num_workers=%d, seed=%d",
+            device,
+            num_workers,
+            seed,
+        )
+        if num_workers == 0:
+            logger.warning(
+                "num_workers=0: retrosynthesis runs in the main process "
+                "and may slow training."
+            )
+        logger.info(
+            "Config:\n%s",
+            OmegaConf.to_yaml(OmegaConf.create(config.to_file_dict())).rstrip(),
+        )
+        logger.info("Output directory: %s", self.output_dir)
+
+        # Reward function and objectives
+        self.conditioning = conditioning
+        self.reward: RewardFunction = reward
+        self.objectives: tuple[str, ...] = tuple(reward.objectives)
+        self.num_objectives: int = len(self.objectives)
+        if not self.objectives or len(set(self.objectives)) != len(self.objectives):
+            raise ValueError("reward.objectives must contain unique objective names")
+        logger.info("Objectives: %s", ", ".join(self.objectives))
+
+        self.setup()
+
+    def setup(self) -> None:
+        self._setup_env()
+        self._setup_model()
+        self._setup_optimizer()
+        self._setup_replay()
+        self._setup_training()
+
+    def _setup_env(self) -> None:
+        cfg = self.config
+        # Initialize the environment
+        logger.info("Loading environment: %s", cfg.env_dir)
+        self.env = SynthesisEnv(
+            cfg.env_dir,
+            cfg.generation.max_atoms,
+            cfg.generation.max_reactions,
+            cfg.generation.min_synthons,
+            cfg.generation.max_synthons,
+            cfg.generation.min_reactions,
+            cfg.property_penalty,
+            self.num_workers,
+            one_step_cache_size=cfg.backward.cache_size,
+        )
+        logger.info(
+            "Environment loaded: %s libraries, %s synthons.",
+            format(len(self.env.synthons), ","),
+            format(sum(len(lib) for lib in self.env.synthons.values()), ","),
+        )
+
+    def _setup_model(self) -> None:
+        """Initialize the model and policy for online training"""
+        cfg = self.config
+        condition_dim = (
+            self.conditioning.encoding_dim if self.conditioning is not None else None
+        )
+        self.model = RxnFlowModel(
+            self.env, cfg.model, self.num_objectives, condition_dim, cfg.backward
+        ).to(self.device)
+        self.sampling_model = (
+            RxnFlowModel(
+                self.env, cfg.model, self.num_objectives, condition_dim, cfg.backward
+            )
+            .to(self.device)
+            .eval()
+        )
+        self.sampling_model.load_state_dict(self.model.state_dict())
+        self.policy = RxnFlowPolicy(self.env, self.model, cfg, self.device, self.rng)
+        self.sampling_policy = RxnFlowPolicy(
+            self.env, self.sampling_model, cfg, self.device, self.rng
+        )
+        logger.info(
+            "Model initialized: %s parameters",
+            format(sum(p.numel() for p in self.model.parameters()), ","),
+        )
+
+    def _setup_optimizer(self) -> None:
+        """Initialize the optimizer and learning rate scheduler"""
+        cfg = self.config
+        self.policy_parameters = [
+            parameter
+            for name, parameter in self.model.named_parameters()
+            if not name.startswith("_logZ.")
+        ]
+        self.log_z_parameters = list(self.model._logZ.parameters())
+        groups = [
+            {"params": self.policy_parameters},
+            {
+                "params": self.log_z_parameters,
+                "lr": cfg.training.learning_rate_logZ,
+            },
+        ]
+        head = self.model.backward_head
+        if head is not None and cfg.backward.learning_rate is not None:
+            # The backward head gets its own learning rate (gradient clipping still
+            # covers it through policy_parameters). Appended last so group 0 stays the
+            # policy group that the learning-rate log reports.
+            head_ids = {id(p) for p in head.parameters()}
+            groups[0] = {
+                "params": [p for p in self.policy_parameters if id(p) not in head_ids]
+            }
+            groups.append(
+                {"params": list(head.parameters()), "lr": cfg.backward.learning_rate}
+            )
+        self.optimizer = torch.optim.Adam(
+            groups,
+            lr=cfg.training.learning_rate,
+            weight_decay=cfg.training.weight_decay,
+        )
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, lambda step: 2 ** (-step / cfg.training.lr_decay_steps)
+        )
+
+    def _setup_replay(self) -> None:
+        """Initialize the replay buffer."""
+        cfg = self.config
+        self.replay = ReplayBuffer(
+            cfg.training.replay_capacity,
+            cfg.training.num_replay_insert,
+            cfg.training.replay_insert_priority,
+        )
+
+    def _setup_training(self) -> None:
+        """Initialize the gfn training components"""
+        cfg = self.config
+
+        backward_objective = None
+        if cfg.backward.learned:
+            self.backward_policy = BackwardPolicy(self.env, self.model, cfg, self.device)
+            backward_objective = BackwardObjective(
+                self.backward_policy,
+                cfg.backward,
+                replay=self.replay,
+                rng=self.rng,
+            )
+        self.tb = TrajectoryBalance(
+            self.policy,
+            cfg.reward.moo_scalarization,
+            cfg.training.reward_floor,
+            loss_fn=cfg.training.loss_fn,
+            backward=backward_objective,
+        )
+        self.step = 0
+        self.condition_sampler: ConditionSampler = ConditionSampler(
+            cfg.reward.beta,
+            cfg.reward.moo_preference,
+            self.num_objectives,
+            cfg.reward.moo_scalarization,
+        )
+
+    def _reward_class_name(self) -> str:
+        return f"{type(self.reward).__module__}.{type(self.reward).__qualname__}"
+
+    def save_checkpoint(self, path: str | Path | None = None) -> Path:
+        """Save model, optimizer, replay, and RNG state for an exact restart."""
+        destination = (
+            Path(path)
+            if path is not None
+            else self.checkpoint_dir / f"step_{self.step:06d}.ckpt"
+        )
+        started = perf_counter()
+        logger.info("Saving checkpoint at step %d: %s", self.step, destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(".tmp")
+        torch.save(
+            {
+                "rxnflow_version": __version__,
+                "step": self.step,
+                "config": self.config.to_dict(),
+                "run": {
+                    "output_dir": str(self.output_dir),
+                    "device": str(self.device),
+                    "seed": self.seed,
+                },
+                "environment": self.env.signature,
+                "model": self.model.state_dict(),
+                "sampling_model": self.sampling_model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "lr_scheduler": self.lr_scheduler.state_dict(),
+                "replay": self.replay.state_dict(),
+                "numpy_rng": self.rng.bit_generator.state,
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": (
+                    torch.cuda.get_rng_state(self.device)
+                    if self.device.type == "cuda"
+                    else None
+                ),
+                "condition_dim": self.model.condition_dim,
+                "objectives": self.objectives,
+                "reward_class": self._reward_class_name(),
+            },
+            temporary,
+        )
+        temporary.replace(destination)
+        latest = self.checkpoint_dir / "latest.ckpt"
+        latest_temporary = latest.with_suffix(".tmp")
+        # Copy serialized bytes; do not deserialize the replay and optimizer
+        # just to serialize the identical checkpoint again.
+        shutil.copyfile(destination, latest_temporary)
+        latest_temporary.replace(latest)
+        logger.info("Checkpoint saved: %s (%.1fs)", destination, perf_counter() - started)
+        return destination
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        # RNG states are CPU byte tensors even for a CUDA model. Parameter and
+        # optimizer loaders move their own tensors to the model device.
+        logger.info("Loading checkpoint: %s", path)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        check_model_compatibility(checkpoint["rxnflow_version"])
+        saved_environment = checkpoint["environment"]
+        check_library_compatibility(saved_environment["rxnflow_version"])
+        if checkpoint.get("config") != self.config.to_dict():
+            raise ValueError(
+                "restart configuration differs from the resolved checkpoint configuration"
+            )
+        # Resume restores catalog-indexed actions in replay; sampling can replace
+        # the catalog, but resume requires identical content and synthesis rules.
+        if (
+            saved_environment["content_sha256"] != self.env.signature["content_sha256"]
+            or saved_environment["synthesis"] != self.env.signature["synthesis"]
+        ):
+            raise ValueError(
+                "prepared environment differs from the checkpoint environment"
+            )
+        if checkpoint.get("reward_class") != self._reward_class_name():
+            raise ValueError(
+                "reward implementation differs from the checkpoint reward class"
+            )
+        if checkpoint["objectives"] != self.objectives:
+            raise ValueError("reward objectives differ from the checkpoint")
+        if checkpoint["condition_dim"] != self.model.condition_dim:
+            raise ValueError("external condition dimension differs from the checkpoint")
+        # Restore training state only after config, catalog, and reward match.
+        self.model.load_state_dict(checkpoint["model"])
+        self.sampling_model.load_state_dict(checkpoint["sampling_model"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        self.replay.load_state_dict(checkpoint["replay"])
+        self.rng.bit_generator.state = checkpoint["numpy_rng"]
+        torch.set_rng_state(checkpoint["torch_rng"])
+        # CPU checkpoints have no CUDA RNG state; keep the initialized device RNG.
+        if self.device.type == "cuda" and checkpoint["cuda_rng"] is not None:
+            torch.cuda.set_rng_state(checkpoint["cuda_rng"], self.device)
+        self.seed = checkpoint["run"]["seed"]
+        self.step = int(checkpoint["step"])
+        logger.info(
+            "Checkpoint restored: step=%d, replay=%s",
+            self.step,
+            format(len(self.replay), ","),
+        )
+
+    def _assign_rewards(self, trajectories: list[Trajectory]) -> None:
+        """Retain user scores and apply terminal property penalties before beta."""
+        smiles_list = [
+            value.final_smiles if value.valid else None for value in trajectories
+        ]
+        cond_list = (
+            [t.cond for t in trajectories] if self.conditioning is not None else None
+        )
+        values = self.reward.run(smiles_list, cond_list)
+        property_rewards, violations = compute_property_rewards(
+            smiles_list,
+            self.env.property_limits,
+            self.env.max_atoms,
+            self.config.reward.property_penalty_ratio,
+        )
+        # Property penalties multiply the scalarized reward, independently of
+        # MOO preference. Floor inputs here; TB also floors the final reward.
+        reward_floor = self.config.training.reward_floor
+        preference = np.array([t.preference for t in trajectories], dtype=np.float64)
+        log_rewards = scalarize_log_rewards(
+            values.astype(np.float64).clip(min=reward_floor),
+            moo_scalarization=self.config.reward.moo_scalarization,
+            moo_preference=preference,
+        )
+        log_rewards += np.log(property_rewards.astype(np.float64).clip(min=reward_floor))
+        scalar_rewards = np.exp(log_rewards).tolist()
+        for trajectory, objectives, property_reward, violation, scalar in zip(
+            trajectories,
+            values.tolist(),
+            property_rewards.tolist(),
+            violations.tolist(),
+            scalar_rewards,
+            strict=True,
+        ):
+            trajectory.objective_rewards = objectives
+            trajectory.property_reward = property_reward
+            trajectory.property_violation = violation
+            trajectory.reward = scalar if trajectory.valid else 0.0
+
+    @torch.no_grad()
+    def _update_ema(self) -> None:
+        decay = self.config.training.ema_decay
+        for target, source in zip(
+            self.sampling_model.parameters(), self.model.parameters(), strict=True
+        ):
+            target.mul_(decay).add_(source, alpha=1 - decay)
+
+    def _clip_policy_gradients(self) -> torch.Tensor:
+        """Clip policy gradients and return their pre-clip norm."""
+        grad_clip = self.config.training.grad_clip
+        norm = torch.nn.utils.clip_grad_norm_(self.policy_parameters, grad_clip)
+        return norm
+
+    def _write_samples(self, trajectories: list[Trajectory]) -> None:
+        """Retain online molecules, rewards and complete synthesis routes."""
+        with self.sample_path.open("a") as handle:
+            for index, value in enumerate(trajectories):
+                traj = []
+                for transition in value.steps:
+                    traj.append(
+                        {
+                            "state": transition.state.smiles,
+                            **self.env.action_to_dict(transition.action),
+                            "product_smiles": transition.product_smiles,
+                        }
+                    )
+                sample = {
+                    "step": self.step,
+                    "sample": index,
+                    "final_smiles": value.final_smiles,
+                    "reward": value.reward,
+                    "objective_rewards": value.objective_rewards,
+                    "property_reward": value.property_reward,
+                    "property_violation": value.property_violation,
+                    "beta": value.beta,
+                    "preference": value.preference,
+                    **{f"cond_{key}": item for key, item in (value.cond or {}).items()},
+                    "valid": value.valid,
+                    "invalid_reason": value.invalid_reason,
+                    "traj": traj,
+                }
+                handle.write(json.dumps(sample) + "\n")
+
+    def close(self) -> None:
+        """Release environment workers; model and replay remain available."""
+        self.env.close()
+
+    def run(
+        self,
+        num_steps: int,
+        *,
+        resume_from_checkpoint: str | Path | None = None,
+    ) -> Path:
+        """Run additional optimization steps and return the final checkpoint."""
+        run_started = perf_counter()
+        try:
+            if resume_from_checkpoint is not None:
+                self.load_checkpoint(resume_from_checkpoint)
+            if num_steps < 0:
+                raise ValueError("steps must be non-negative")
+            final_step = self.step + num_steps
+            log_path = self.output_dir / "training.jsonl"
+            last_saved_step = -1
+            checkpoint = None
+            logger.info("Starting training; full log at %s", log_path)
+            while self.step < final_step:
+                # 1. Generate online trajectories with the EMA model and score rewards.
+                started = perf_counter()
+                self.sampling_model.eval()
+                count = self.config.training.num_online
+                beta, preference = self.condition_sampler.sample(count, self.rng)
+                cond_list, cond = None, None
+                if self.conditioning is not None:
+                    cond_list = self.conditioning.sample(count, self.rng)
+                    cond = torch.from_numpy(self.conditioning.encode(cond_list)).to(
+                        self.device
+                    )
+                online_trajs = self.sampling_policy.sample_from_model(
+                    self.config.training.num_online,
+                    beta=beta,
+                    preference=preference,
+                    cond=cond,
+                    cond_list=cond_list,
+                    random_action_prob=self.config.training.random_action_prob,
+                    # The learned P_B needs no recursive route search while sampling.
+                    analyze_backward=not self.config.backward.learned,
+                )
+                sample_time = perf_counter() - started
+                self._assign_rewards(online_trajs)
+                # 2. Sample replay before insertion so online trajectories cannot be
+                # duplicated as replay entries in this same optimization batch.
+                replay_trajs = self.replay.sample(
+                    self.config.training.num_replay, self.rng
+                )
+                batch = online_trajs + replay_trajs
+                self.replay.add(online_trajs, self.rng)
+                # 3. Update the policy/logZ, learning rates, and EMA sampling weights.
+                self.model.train()
+                self.optimizer.zero_grad(set_to_none=True)
+                # Replay retains its original conditions; never sample new labels here.
+                cond = None
+                if self.conditioning is not None:
+                    cond = torch.from_numpy(
+                        self.conditioning.encode([t.cond for t in batch])
+                    ).to(self.device)
+                loss, loss_info = self.tb.compute_batch_losses(
+                    batch,
+                    cond=cond,
+                    num_online=len(online_trajs),
+                    num_replay=len(replay_trajs),
+                )
+                loss.backward()
+                # clip_grad_norm_ already returns the pre-clip norm. No second
+                # traversal of policy gradients is needed for diagnostics.
+                policy_grad_norm = self._clip_policy_gradients()
+                loss_info.update(
+                    policy_grad_norm=policy_grad_norm,
+                    # Total pre-clip norm includes the unclipped logZ head.
+                    grad_norm=(
+                        policy_grad_norm.square()
+                        + sum(
+                            p.grad.square().sum()
+                            for p in self.log_z_parameters
+                            if p.grad is not None
+                        )
+                    ).sqrt(),
+                )
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self._update_ema()
+                self.step += 1
+
+                # 4. Collect scalar diagnostics, persist online attempts, and checkpoint.
+                # Transfer scalar diagnostics together rather than synchronizing
+                # CUDA separately for every metric. TB values are pre-update.
+                loss_metrics = dict(
+                    zip(
+                        loss_info,
+                        torch.stack(list(loss_info.values())).detach().cpu().tolist(),
+                        strict=True,
+                    )
+                )
+                # Generation statistics describe fresh online attempts, excluding replay.
+                num_valid = sum(value.valid for value in online_trajs)
+                num_unique = len(
+                    {value.final_smiles for value in online_trajs if value.valid}
+                )
+                record = {
+                    "step": self.step,
+                    **loss_metrics,
+                    "num_online": len(online_trajs),
+                    "num_replay": len(batch) - len(online_trajs),
+                    "num_valid": num_valid,
+                    "num_invalid": len(online_trajs) - num_valid,
+                    "num_unique": num_unique,
+                    "learning_rate": self.optimizer.param_groups[0]["lr"],
+                    "reward": sum(value.reward for value in online_trajs)
+                    / len(online_trajs),
+                    "objective_rewards": {
+                        f"r_{name}": sum(t.objective_rewards[i] for t in online_trajs)
+                        / len(online_trajs)
+                        for i, name in enumerate(self.objectives)
+                    },
+                    "property_reward": sum(t.property_reward for t in online_trajs)
+                    / len(online_trajs),
+                    "num_property_violations": sum(
+                        t.property_violation for t in online_trajs
+                    ),
+                    "traj_lens": sum(len(value.steps) for value in online_trajs)
+                    / len(online_trajs),
+                    "sampling_time": sample_time,
+                    "time": perf_counter() - started,
+                }
+
+                # Log the generated trajectories and training metrics.
+                self._write_samples(online_trajs)
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+                if (
+                    self.step == final_step
+                    or self.step % self.config.training.log_every == 0
+                ):
+                    objectives = " ".join(
+                        f"{name}={value:.4f}"
+                        for name, value in record["objective_rewards"].items()
+                    )
+                    logger.info(
+                        "Step %d/%d: loss=%.4f reward=%.4f valid=%.1f%% "
+                        "unique=%.1f%% property_reward=%.4f violations=%d "
+                        "replay=%d time=%.2fs | %s",
+                        self.step,
+                        final_step,
+                        record["loss"],
+                        record["reward"],
+                        100 * record["num_valid"] / record["num_online"],
+                        100 * record["num_unique"] / max(1, record["num_valid"]),
+                        record["property_reward"],
+                        record["num_property_violations"],
+                        len(self.replay),
+                        record["time"],
+                        objectives,
+                    )
+                if self.step % self.config.training.checkpoint_every == 0:
+                    checkpoint = self.save_checkpoint()
+                    last_saved_step = self.step
+            if last_saved_step != self.step:
+                checkpoint = self.save_checkpoint()
+            assert checkpoint is not None
+            logger.info(
+                "Training complete: step=%d, elapsed=%.1fs",
+                self.step,
+                perf_counter() - run_started,
+            )
+            return checkpoint
+        except BaseException:
+            logger.info(
+                "Training interrupted at step %d; see traceback for details", self.step
+            )
+            raise
+        finally:
+            self.close()

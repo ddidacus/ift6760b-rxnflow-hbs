@@ -1,0 +1,18 @@
+# QED with a learned P_B trained by REINFORCE on backward rollouts (validity reward + entropy bonus).
+env_dir: ./data/envs/example_5k/
+
+reward:
+  beta: "32"
+  settings: {}
+
+subsampling:
+  sampling_ratio: 0.2 # small library -> increase ratio for less variance
+
+property_penalty:
+  mw: 500
+
+backward:
+  mode: learned
+  objective: reinforce
+  reinforce_weight: 1.0
+  entropy_weight: 1.0 # SynFlowNet's best setting; 0 and 2 are the ablations

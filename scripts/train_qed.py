@@ -1,0 +1,72 @@
+# Source: examples/qed.py
+"""Local QED reward and training example.
+
+Run: python examples/qed.py --config configs/qed.yaml --steps 1000.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import torch
+from rdkit import Chem
+from rdkit.Chem import QED
+
+from IFT6760 import Config, RewardFunction, RxnFlowTrainer
+
+
+class QEDReward(RewardFunction):
+    objectives = ("qed",)
+
+    def score(self, smiles_list: list[str]) -> np.ndarray:
+        mols = [Chem.MolFromSmiles(smi) for smi in smiles_list]
+        qeds = [QED.qed(mol) for mol in mols]
+        return np.array(qeds, dtype=np.float32).reshape(-1, 1)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=Path("runs/qed"))
+    parser.add_argument(
+        "--steps", type=int, required=True, help="additional training updates"
+    )
+    parser.add_argument(
+        "--device", help="device, e.g. cpu or cuda; omitted selects CUDA when available"
+    )
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--resume-from-checkpoint", type=Path)
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        nargs="*",
+        default=[],
+        metavar="KEY=VALUE",
+        help="config overrides, e.g. backward.learning_rate=0.003 backward.entropy_weight=2",
+    )
+    args = parser.parse_args(argv)
+    device = (
+        args.device
+        if args.device is not None
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    config = Config.from_file(args.config, args.overrides)
+    reward = QEDReward(**config.reward.settings)
+    trainer = RxnFlowTrainer(
+        config,
+        reward,
+        seed=args.seed,
+        output_dir=args.output_dir,
+        device=device,
+        num_workers=4,
+    )
+    checkpoint = trainer.run(
+        args.steps, resume_from_checkpoint=args.resume_from_checkpoint
+    )
+    print(checkpoint)
+
+
+if __name__ == "__main__":
+    main()

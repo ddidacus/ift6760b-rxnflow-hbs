@@ -1,0 +1,17 @@
+# QED with a learned P_B trained by maximum likelihood on the generated edges.
+env_dir: ./data/envs/example_5k/
+
+reward:
+  beta: "32"
+  settings: {}
+
+subsampling:
+  sampling_ratio: 0.2 # small library -> increase ratio for less variance
+
+property_penalty:
+  mw: 500
+
+backward:
+  mode: learned
+  objective: mle
+  mle_weight: 1.0

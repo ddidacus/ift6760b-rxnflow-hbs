@@ -1,0 +1,266 @@
+# Source: src/rxnflow/core/types.py
+"""Small serializable domain types shared by training and sampling."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
+from enum import IntEnum
+from functools import cached_property
+from typing import Any, Literal, TypeAlias
+
+import numpy as np
+from rdkit import Chem
+
+from .molecule import Molecule
+
+# Action name and optional synthon library; unimolecular actions use None.
+ActionKey: TypeAlias = tuple[str, str | None]
+
+# A list of ActionSubspace objects, one per reaction and library pair.
+ActionSpace = list["ActionSubspace"]
+
+# Reverse-ordered edges: (forward action, parent SMILES), ending at the empty
+# state's SMILES "" through FirstSynthon. The number of entries is the route length.
+BackwardTrajectory = list[tuple["Action", str]]
+
+# One reverse step: (forward action, parent SMILES); the empty state's SMILES is "".
+BackwardEdge = tuple["Action", str]
+
+# Named external conditions, e.g. pocket keys or target property values.
+Condition: TypeAlias = dict[str, Any]
+
+InvalidReason = Literal["invalid_transition", "max_reactions"]
+
+
+class ActionType(IntEnum):
+    FIRST_SYNTHON = 0
+    UNIRXN_TRANSFORM = 1
+    UNIRXN_TERMINAL = 2
+    BIRXN_BRICK = 3
+    BIRXN_LINKER = 4
+
+    @property
+    def is_first(self) -> bool:
+        return self == ActionType.FIRST_SYNTHON
+
+    @property
+    def is_unirxn(self) -> bool:
+        return self in (ActionType.UNIRXN_TRANSFORM, ActionType.UNIRXN_TERMINAL)
+
+    @property
+    def is_birxn(self) -> bool:
+        return self in (ActionType.BIRXN_BRICK, ActionType.BIRXN_LINKER)
+
+    @property
+    def cost(self) -> tuple[int, int]:
+        """(reactions, synthons) this action type consumes.
+
+        The MDP's counting rule, stated once: FirstSynthon spends a synthon but no
+        reaction, a unimolecular reaction spends a reaction but no synthon, and a
+        bimolecular reaction spends one of each.
+        """
+        return (0 if self.is_first else 1, 0 if self.is_unirxn else 1)
+
+
+@dataclass(frozen=True)
+class State:
+    """A molecule and trajectory metadata; the empty state has no molecule."""
+
+    molecule: Molecule | None = None
+    num_reactions: int = 0
+    terminated: bool = False
+    num_synthons: int = 0
+    # graph features
+    _cache: dict[str, Any] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    @cached_property
+    def attachment_type(self) -> int | None:
+        if self.rdmol is None:
+            return None
+        else:
+            attach_atoms = [
+                atom for atom in self.rdmol.GetAtoms() if atom.GetAtomicNum() == 0
+            ]
+            assert len(attach_atoms) == 1
+            return attach_atoms[0].GetIsotope()
+
+    @property
+    def rdmol(self) -> Chem.Mol | None:
+        return None if self.molecule is None else self.molecule.rdmol
+
+    @property
+    def smiles(self) -> str:
+        return "" if self.molecule is None else self.molecule.smiles
+
+    @classmethod
+    def from_smiles(
+        cls,
+        smiles: str,
+        num_reactions: int = 0,
+        terminated: bool = False,
+        num_synthons: int = 1,
+    ) -> State:
+        rdmol = Chem.MolFromSmiles(smiles) if smiles else None
+        if smiles and rdmol is None:
+            raise ValueError(f"invalid state SMILES: {smiles}")
+        molecule = None if rdmol is None else Molecule(rdmol=rdmol)
+        return cls(
+            molecule,
+            num_reactions,
+            terminated,
+            num_synthons if molecule is not None else 0,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "smiles": self.smiles,
+            "num_reactions": self.num_reactions,
+            "num_synthons": self.num_synthons,
+            "terminated": self.terminated,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> State:
+        return cls.from_smiles(**data)
+
+
+@dataclass(frozen=True)
+class Action:
+    """A selected reaction and optional oriented catalog row."""
+
+    action_type: ActionType
+    reaction: str | None = None
+    library_name: str | None = None
+    synthon_index: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action_type.name,
+            "reaction": self.reaction,
+            "library_name": self.library_name,
+            "synthon_index": self.synthon_index,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Action:
+        data = data.copy()
+        data["action_type"] = ActionType[data.pop("action_type")]
+        return cls(**data)
+
+
+@dataclass
+class ActionSubspace:
+    """One (reaction, library) pair, independent of policy logits.
+
+    A unimolecular reaction uses library=None and has one action. num_actions is the
+    full library size; sample_indices=None selects that full range. A sampled
+    subspace holds one array mapping columns back to original synthon indices.
+    """
+
+    name: ActionKey
+    action_type: ActionType
+    num_actions: int
+    sample_indices: np.ndarray | None = None
+
+    def action_at(self, column: int) -> Action:
+        reaction, library = self.name
+        synthon_index = None
+        if library is not None:
+            synthon_index = (
+                column
+                if self.sample_indices is None
+                else int(self.sample_indices[column])
+            )
+        return Action(
+            self.action_type,
+            reaction=None if self.action_type == ActionType.FIRST_SYNTHON else reaction,
+            library_name=library,
+            synthon_index=synthon_index,
+        )
+
+
+@dataclass
+class Transition:
+    """One observed action, its product, and the estimated backward log probability."""
+
+    state: State
+    action: Action
+    product_smiles: str
+    log_p_B: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state.to_dict(),
+            "action": self.action.to_dict(),
+            "product_smiles": self.product_smiles,
+            "log_p_B": self.log_p_B,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Transition:
+        return cls(
+            state=State.from_dict(data["state"]),
+            action=Action.from_dict(data["action"]),
+            product_smiles=data["product_smiles"],
+            log_p_B=data["log_p_B"],
+        )
+
+
+@dataclass
+class Trajectory:
+    steps: list[Transition]
+    final_smiles: str
+    # Conditions are fixed for the entire trajectory, including replay.
+    beta: float
+    preference: list[float]
+    objective_rewards: list[float] = field(default_factory=list)
+    property_reward: float = 1.0
+    property_violation: bool = False
+    reward: float = 0.0
+    valid: bool = True
+    invalid_reason: InvalidReason | None = None
+    cond: Condition | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "steps": [step.to_dict() for step in self.steps],
+            "final_smiles": self.final_smiles,
+            "beta": self.beta,
+            "preference": list(self.preference),
+            "cond": deepcopy(self.cond),
+            "objective_rewards": list(self.objective_rewards),
+            "property_reward": self.property_reward,
+            "property_violation": self.property_violation,
+            "reward": self.reward,
+            "valid": self.valid,
+            "invalid_reason": self.invalid_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Trajectory:
+        return cls(
+            steps=[Transition.from_dict(step) for step in data["steps"]],
+            final_smiles=data["final_smiles"],
+            beta=data["beta"],
+            preference=list(data["preference"]),
+            cond=deepcopy(data.get("cond")),
+            objective_rewards=list(data["objective_rewards"]),
+            property_reward=data["property_reward"],
+            property_violation=data["property_violation"],
+            reward=data["reward"],
+            valid=data["valid"],
+            invalid_reason=data["invalid_reason"],
+        )
+
+
+@dataclass
+class SamplingResult:
+    smiles: str
+    traj: list[dict[str, Any]]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)

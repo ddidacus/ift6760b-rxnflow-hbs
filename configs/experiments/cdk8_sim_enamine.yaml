@@ -1,0 +1,18 @@
+# CDK8 similarity on Enamine-290k, heuristic P_B: the baseline arm. 
+env_dir: ./data/envs/enamine_290k/
+
+reward:
+  beta: "32"
+  settings:
+    target: cdk8
+
+subsampling:
+  sampling_ratio: 0.1
+  min_sampling: 50
+  importance_temp: 1.0
+
+property_penalty:
+  mw: 500
+
+backward:
+  mode: heuristic

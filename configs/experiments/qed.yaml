@@ -1,0 +1,13 @@
+# Source: configs/qed.yaml
+# Minimal QED training configuration.
+env_dir: ./data/envs/example_5k/
+
+reward:
+  beta: "32"
+  settings: {}
+
+subsampling:
+  sampling_ratio: 0.2 # small library -> increase ratio for less variance
+
+property_penalty:
+  mw: 500

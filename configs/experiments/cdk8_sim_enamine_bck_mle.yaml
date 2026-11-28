@@ -1,0 +1,21 @@
+# CDK8 similarity on Enamine-290k, P_B trained by maximum likelihood.
+# The primary learned arm: MLE fits P_B toward the forward policy's own posterior.
+env_dir: ./data/envs/enamine_290k/
+
+reward:
+  beta: "32"
+  settings:
+    target: cdk8
+
+subsampling:
+  sampling_ratio: 0.1
+  min_sampling: 50
+  importance_temp: 1.0
+
+property_penalty:
+  mw: 500
+
+backward:
+  mode: learned
+  objective: mle
+  mle_weight: 1.0

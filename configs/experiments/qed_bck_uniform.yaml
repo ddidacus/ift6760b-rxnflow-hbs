@@ -1,0 +1,16 @@
+# QED with a frozen uniform P_B over the one-step reverse candidates (control for the learned variants).
+env_dir: ./data/envs/example_5k/
+
+reward:
+  beta: "32"
+  settings: {}
+
+subsampling:
+  sampling_ratio: 0.2 # small library -> increase ratio for less variance
+
+property_penalty:
+  mw: 500
+
+backward:
+  mode: learned
+  objective: none
