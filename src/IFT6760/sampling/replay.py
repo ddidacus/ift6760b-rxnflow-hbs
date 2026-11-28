@@ -23,8 +23,8 @@ class ReplayBuffer:
         self.capacity = capacity
         self.num_insert = num_insert
         self.insert_priority = insert_priority
-        # Store plain trajectory data, including all conditions and objective
-        # rewards. Sampling preserves these conditions; no relabeling.
+        # Store conditions and objective rewards with each trajectory; replay does not
+        # relabel.
         self._items: list[dict[str, Any]] = []
         self._next = 0
 
@@ -34,14 +34,13 @@ class ReplayBuffer:
     def add(self, trajectories: list[Trajectory], rng: np.random.Generator) -> None:
         if not self.capacity or self.num_insert == 0:
             return
-        # Admission acts only on this online batch. Preserve its original order
-        # for FIFO eviction, and avoid RNG work when all trajectories are kept.
+        # Keep online order for FIFO eviction; skip RNG work when admitting the whole
+        # batch.
         if self.num_insert is not None and self.num_insert < len(trajectories):
             if self.insert_priority == "uniform":
                 indices = rng.choice(len(trajectories), self.num_insert, replace=False)
             else:
-                # Rank by the stored scalar reward under the original preference,
-                # before beta. Stable sorting retains input order for tied rewards.
+                # Rank by the original preference, before beta; keep input order for ties.
                 rewards = np.asarray([t.reward for t in trajectories])
                 indices = np.argsort(-rewards, kind="stable")[: self.num_insert]
             trajectories = [trajectories[i] for i in sorted(indices)]
@@ -57,11 +56,9 @@ class ReplayBuffer:
         size = len(self._items)
         if count <= 0 or not size:
             return []
-        # Logical indices are oldest-first, including after wrap and restart.
-        # Draw O(batch size) indices rather than copying the whole replay deque.
+        # Sample oldest-first logical indices without copying the full buffer.
         indices = range(size) if count >= size else rng.choice(size, count, replace=False)
-        # Reconstruct only the sampled batch. Its molecule objects are not
-        # retained by the buffer after the training update finishes.
+        # Reconstruct only the sampled batch; the buffer retains no molecule objects.
         return [
             Trajectory.from_dict(self._items[(self._next + i) % size]) for i in indices
         ]

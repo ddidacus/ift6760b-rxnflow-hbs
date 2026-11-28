@@ -21,8 +21,6 @@ from IFT6760.envs.retrosynthesis import RetroSynthesisAnalyzer
 
 
 class SynthesisEnv:
-    """Synthon-based linear synthesis environment"""
-
     def __init__(
         self,
         env_dir: str | Path,
@@ -64,7 +62,6 @@ class SynthesisEnv:
         self._build_feasible_action_spaces()
 
     def _load_libraries(self) -> None:
-        """Load aligned synthon data and derive library/type indices."""
         self.synthons = load_synthon_libraries(self.env_dir)
         with (self.env_dir / "building_blocks.smi").open(encoding="utf-8") as handle:
             records = (line.rstrip("\n").split("\t") for line in handle)
@@ -84,8 +81,8 @@ class SynthesisEnv:
             raise ValueError("prepared environment contains no one-site bricks")
 
         self.synthon_types = set(load_synthon_templates(self.env_dir / "synthon.yaml"))
-        # Index zero represents an absent remaining site on a brick.
-        # Chemical types use stable indices independent of catalog membership.
+        # Reserve index 0 for an absent site; chemical type indices are
+        # catalog-independent.
         self.synthon_type_to_index = {
             t: i + 1 for i, t in enumerate(sorted(self.synthon_types))
         }
@@ -106,7 +103,6 @@ class SynthesisEnv:
                 raise ValueError(f"invalid brick/linker type: {library.name}")
 
     def _load_reactions(self) -> None:
-        """Compile oriented reactions and assign their policy indices."""
         self.uni_reactions, self.bi_reactions = load_reactions(
             self.env_dir / "reaction.yaml"
         )
@@ -121,7 +117,6 @@ class SynthesisEnv:
                 raise ValueError(f"unknown synthon type in {reaction.name}")
 
     def _load_action_spaces(self) -> None:
-        """Connect prepared reaction/library pairs to the loaded runtime objects."""
         spaces = json.loads((self.env_dir / "action_space.json").read_text())
 
         def load_space(pairs: list[list[str | None]]) -> ActionSpace:
@@ -156,11 +151,7 @@ class SynthesisEnv:
         }
 
     def _build_feasible_action_spaces(self) -> None:
-        """Keep type-level paths that can terminate within the synthesis limits.
-
-        This ensure that `get_action_space` always returns a action space that
-        can reach a terminal state.
-        """
+        """Keep type-level paths that can terminate within the synthesis limits."""
         self.feasible_action_spaces: dict[tuple[int, int, int], ActionSpace] = {}
         for reactions in range(self.max_reactions, -1, -1):
             for synthons in range(1, self.max_synthons + 1):
@@ -191,8 +182,8 @@ class SynthesisEnv:
                             if reachable:
                                 allowed.append(subspace)
                     self.feasible_action_spaces[site, synthons, reactions] = allowed
-        # FirstSynthon consumes a synthon but no reaction. Exclude starting types
-        # with no complete route under these limits.
+        # Starting types need a complete route after FirstSynthon, which costs no
+        # reaction.
         self.initial_action_space = [
             subspace
             for subspace in self.initial_action_space
@@ -231,13 +222,10 @@ class SynthesisEnv:
     def parent_counts(
         action: Action, reactions: int, synthons: int
     ) -> tuple[int, int] | None:
-        """Counters of the state reached by undoing `action`, or None if there is none.
+        """Return (reactions, synthons) after undoing action, or None if invalid.
 
-        Undoing FirstSynthon must land on the empty state, so it is available only from a
-        state built from exactly one synthon and no reaction; every other reverse step
-        must leave a state that still holds a synthon. This is what makes P_B a
-        distribution over the parents of `(molecule, reactions, synthons)` rather than
-        over the reverse steps of the molecule alone.
+        FirstSynthon must return to (0, 0). Other actions must leave at least one
+        synthon and a non-negative reaction count.
         """
         cost_r, cost_s = action.action_type.cost
         reactions, synthons = reactions - cost_r, synthons - cost_s
@@ -262,8 +250,6 @@ class SynthesisEnv:
         return self.feasible_action_spaces[key]
 
     def _apply_action(self, current: Molecule | None, action: Action) -> Molecule | None:
-        """Apply FirstSynthon/UniReaction/BiReaction and return a valid molecule."""
-        # 1. Resolve the selected synthon row.
         if action.library_name is not None:
             library = self.synthons[action.library_name]
             if action.synthon_index is None or not 0 <= action.synthon_index < len(
@@ -274,10 +260,8 @@ class SynthesisEnv:
         elif action.synthon_index is not None:
             raise ValueError("unimolecular actions do not take a synthon_index")
 
-        # 2. Apply the transformation and determine the expected remaining sites.
         if action.action_type == ActionType.FIRST_SYNTHON:
-            # Catalog attachment markers are always 0. A first brick becomes a
-            # state with its chemical synthon type restored from the library.
+            # Restore the chemical type of the catalog attachment marker (isotope 0).
             first = parse_molecule(synthon_smiles)
             assert first is not None
             for atom in first.GetAtoms():
@@ -299,11 +283,9 @@ class SynthesisEnv:
                     current, Molecule(smiles=synthon_smiles, rdmol=synthon)
                 )
                 expected = library.synthon_types[1:]
-        # 3. Check remaining sites and structural change. The approximate atom
-        # budget affects action selection; exceeding it does not invalidate a product.
+        # The atom budget guides sampling; exceeding it does not invalidate chemistry.
         if product is None or typed_dummy_isotopes(product.rdmol) != expected:
             return None
-        # Reject transformations that leave the canonical structure unchanged.
         if current is not None and product.smiles == current.smiles:
             return None
         return product

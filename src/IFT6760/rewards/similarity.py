@@ -1,14 +1,6 @@
-"""2D fingerprint similarity to a reference ligand.
+"""Morgan fingerprint Tanimoto reward against a reference ligand.
 
-A cheap, target-directed reward: Tanimoto similarity between each molecule's Morgan
-fingerprint and a reference ligand's. About 50 us per molecule, against ~1.7 s for the 3D
-shape overlay it stands in for, and it does not saturate the way QED does.
-
-It is a different objective from shape overlay, not a proxy for it: the CDK8 query and the
-5IDN ligand it was overlaid onto score 1.09/2.0 on 3D combo but 0.20 here. See
-notes/11-experiment-design.md sections 2.6 and 4.
-
-Target names follow `hbs/reward.py` in the RxnFlow-HBS fork so configurations match.
+Target names match hbs/reward.py in RxnFlow-HBS.
 """
 
 from __future__ import annotations
@@ -39,13 +31,11 @@ TARGET_FILES = {
 
 
 class SimilarityReward(RewardFunction):
-    """Tanimoto similarity of a Morgan fingerprint to a reference ligand.
+    """Tanimoto similarity to the first molecule in a reference SDF.
 
-    `target` names a file in `query_dir`; `sdf_path` overrides it with any other file.
-    The reference is the SDF's first molecule, which is what a 3D overlay would query
-    with -- not the SMILES in its property fields, which for CDK8 names a different
-    molecule. The default fingerprint matches the one the diversity metrics use, so the
-    reward and `div@k` live in the same space.
+    target selects a file in query_dir; sdf_path overrides it. Use the SDF
+    structure: its SMILES property may name a different molecule (as in CDK8).
+    Default fingerprint settings match the diversity metrics.
     """
 
     objectives = ("similarity",)

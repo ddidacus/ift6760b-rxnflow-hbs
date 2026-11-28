@@ -33,12 +33,10 @@ class RxnFlowSampler:
     ) -> None:
         """Load EMA weights from a full checkpoint or extracted model.
 
-        device selects the sampling device; env_dir overrides the saved catalog path.
-        Conditional checkpoints require the same condition feature mapping
-        used in training.
+        env_dir overrides the saved catalog path. Conditional checkpoints need the
+        same condition feature mapping used in training.
         """
-        # Load once on CPU: sampling needs only EMA weights, not the optimizer
-        # and replay tensors copied to the GPU with the entire checkpoint.
+        # Load on CPU to avoid moving optimizer and replay data to the sampling GPU.
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
         check_model_compatibility(ckpt["rxnflow_version"])
         check_library_compatibility(ckpt["environment"]["rxnflow_version"])
@@ -126,7 +124,6 @@ class RxnFlowSampler:
         cond_list fixes one raw condition per attempt; when omitted, the
         conditioning module samples conditions for each batch.
         """
-        # 1. Resolve requested conditions and reset sampling RNGs when seeded.
         if beta is None:
             beta = self.config.reward.beta
         if preference is None:
@@ -161,7 +158,7 @@ class RxnFlowSampler:
             raise ValueError("sample count must be positive")
         if seed is not None:
             self.rng.bit_generator.state = np.random.default_rng(seed).bit_generator.state
-            torch.manual_seed(seed)  # Device-side categorical draws.
+            torch.manual_seed(seed)
         if softmax_temperature <= 0:
             raise ValueError("softmax temperature must be positive")
         print(
@@ -194,7 +191,6 @@ class RxnFlowSampler:
                 raise ValueError(
                     "cond_list must contain one condition per attempted trajectory"
                 )
-        # 2. Sample a fixed number of trajectories without retrying invalid ones.
         trajectories: list[Trajectory] = []
         for start in range(0, num_samples, batch_size):
             batch_count = min(batch_size, num_samples - start)

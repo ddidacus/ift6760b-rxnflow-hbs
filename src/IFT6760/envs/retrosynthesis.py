@@ -23,22 +23,17 @@ _HYDROGEN_ATOM = Chem.MolFromSmarts("[#1]")
 
 
 class Worker:
-    """Find catalog-supported routes within the supplied reaction and synthon limits.
+    """Find catalog-supported routes within reaction and synthon limits.
 
-    The fewest synthons found bounds further exploration; unimolecular reactions do not
-    consume that budget. Known generated routes remain available above this adaptive
-    bound, but must satisfy the supplied reaction and synthon limits.
-    Candidates must match a catalog entry and reproduce the product forward.
-    Return reverse-ordered edge lists; probability weighting belongs to the policy.
+    Finding a route lowers the synthon bound for further search. Known routes
+    above that bound are retained if they satisfy the original limits.
+    Results are reverse-ordered edge lists, without probability weights.
     """
 
     def __init__(self, env: SynthesisEnv, prune: bool = True):
-        # DFS setting
         self.prune: bool = prune
-        # The environment's generation limits
         self.max_reactions: int = env.max_reactions
         self.max_synthons: int = env.max_synthons
-        # The environment's reaction and synthon definitions
         self.uni_reactions: dict[str, UniReaction] = env.uni_reactions
         self.bi_reactions: dict[str, BiReaction] = env.bi_reactions
         self.brick_types = set(env.brick_types)
@@ -103,10 +98,9 @@ class Worker:
         return dfs.run(mol, known_trajectories)
 
     def one_step(self, smiles: str) -> list[BackwardEdge]:
-        """Single reverse steps from a state SMILES, in canonical order.
+        """Return reverse steps in canonical order, using only the molecule.
 
-        The result depends on the molecule alone (no budgets, pruning or recursion) and
-        the empty state "" has no parents. See `_RetroDFS.one_step`.
+        No budget checks or recursion; the empty state has no parents.
         """
         if not smiles:
             return []
@@ -118,8 +112,6 @@ class Worker:
 
 
 class _RetroDFS:
-    """Own the bounds and caches for one molecule's retrosynthetic search."""
-
     def __init__(
         self,
         worker: Worker,
@@ -137,7 +129,6 @@ class _RetroDFS:
         # Reverse chemistry is independent of DFS budgets and known routes.
         self.cache: dict[str, dict] = {"unirxn": {}, "birxn": {}, "traj": {}}
 
-        # Dynamic synthon limit
         self._max_synthons = min(max_synthons, self.max_depth)
 
     def run(
@@ -146,7 +137,6 @@ class _RetroDFS:
         known_trajectories: list[BackwardTrajectory] | None = None,
     ) -> list[BackwardTrajectory]:
         if known_trajectories is not None:
-            # Filter known routes to those within the current limits
             known_trajectories = [
                 route
                 for route in known_trajectories
@@ -154,7 +144,6 @@ class _RetroDFS:
                 and sum(not action.action_type.is_unirxn for action, _ in route)
                 <= self._max_synthons
             ]
-            # Set the dynamic synthon limit
             if self.prune and known_trajectories:
                 self._max_synthons = min(
                     self._max_synthons,
@@ -172,8 +161,7 @@ class _RetroDFS:
         num_synthons: int,
         known_trajectories: list[BackwardTrajectory] | None = None,
     ) -> list[BackwardTrajectory]:
-        # 1. Count removed bimolecular reactants plus the eventual FirstSynthon.
-        # UniReaction advances depth but leaves this synthon count unchanged.
+        # Count removed synthons plus FirstSynthon; unimolecular steps only add depth.
         if depth > self.max_depth or num_synthons > self._max_synthons:
             return []
         # Cache only under the same remaining reaction and synthon budgets.
@@ -182,11 +170,10 @@ class _RetroDFS:
         if known_trajectories is None and key in self.cache["traj"]:
             return self.cache["traj"][key]
         trajectories = list(known_trajectories or [])
-        # First edges identify backward choices. Retain known suffixes and skip
-        # rediscovering their action/parent pair during this root search.
+        # Keep known suffixes and skip rediscovering their first action/parent pair.
         branch_keys = {trajectory[0] for trajectory in trajectories}
 
-        # 2. Look for a direct FirstSynthon origin by restoring the catalog marker.
+        # Restore the catalog marker to check for a direct FirstSynthon origin.
         signature = typed_dummy_isotopes(molecule.rdmol)
         if len(signature) == 1:
             library_name = str(signature[0])
@@ -210,7 +197,6 @@ class _RetroDFS:
                         trajectories.append([edge])
                         branch_keys.add(edge)
 
-        # 3. Reverse unimolecular transformations and verify each precursor forward.
         if depth < self.max_depth:
             for name, reaction, action in self.uni_candidates.get(signature, ()):
                 reverse_key = (name, canonical)
@@ -236,7 +222,6 @@ class _RetroDFS:
                         trajectories.extend([edge, *suffix] for suffix in suffixes)
                         branch_keys.add(edge)
 
-            # 4. Reverse couplings, recover the oriented synthon, and find its row.
             for name, reaction in self.bi_candidates.get(signature, ()):
                 if num_synthons >= self._max_synthons:
                     break
@@ -250,9 +235,8 @@ class _RetroDFS:
                         break
                     if typed_dummy_isotopes(child.rdmol) != (reaction.state_type,):
                         continue
-                    # Reverse products carry the incoming isotope-0 attachment
-                    # and (for linkers) the remaining type. Together with the
-                    # reaction's incoming type this determines one library.
+                    # The incoming type and remaining dummy label identify the oriented
+                    # library.
                     synthon_sites = typed_dummy_isotopes(synthon.rdmol)
                     if not synthon_sites or synthon_sites[0] != 0:
                         continue
@@ -286,7 +270,7 @@ class _RetroDFS:
                         trajectories.extend([edge, *suffix] for suffix in suffixes)
                         branch_keys.add(edge)
 
-        # 5. Cache only unseeded searches; known routes are specific to a rollout.
+        # Known routes are rollout-specific; cache only unseeded searches.
         if known_trajectories is None:
             self.cache["traj"][key] = trajectories
         return trajectories
@@ -294,10 +278,9 @@ class _RetroDFS:
     def _reverse_birxn(
         self, reaction: BiReaction, product: Molecule, *, complete: bool = False
     ) -> list[tuple[Molecule, Molecule]]:
-        """Process catalog-supported precursor pairs in canonical DFS order.
+        """Find catalog-supported precursor pairs in canonical DFS order.
 
-        `complete` proposes with the forward template's inverse instead of the curated
-        reverse template, so no split the forward reaction could have made is missed.
+        complete=True uses the forward template's inverse for proposals.
         """
         template = reaction.inverse_reaction if complete else reaction.reverse_reaction
         products = {}
@@ -330,7 +313,6 @@ class _RetroDFS:
             if any(key is None for key in keys):
                 continue
             key = tuple(keys)
-            # Allocate wrappers only for complete, unique precursor pairs.
             if key not in products:
                 products[key] = (
                     Molecule(smiles=keys[0], rdmol=molecules[0]),
@@ -339,26 +321,19 @@ class _RetroDFS:
         return [products[key] for key in sorted(products)]
 
     def one_step(self, molecule: Molecule) -> list[BackwardEdge]:
-        """Every single reverse step from `molecule`, without checking the parent.
+        """Return reverse candidates in canonical order, without recursion.
 
-        Candidates are *proposed* by the inverse of each forward template and *kept*
-        only when the removed synthon is a catalog row and the forward reaction
-        reproduces the molecule. Proposing with the inverse rather than the curated
-        reverse template is what makes the set complete: the step that generated a
-        state is always among its candidates, so P_B can score it and a backward walk
-        can take it. `_dfs` keeps the curated reverse template, which encodes
-        retrosynthetic judgement and is RxnFlow's own heuristic.
+        Use inverse forward templates for proposals, then require a catalog synthon
+        and a forward reaction that reproduces the molecule. Ambiguous forward
+        reactions are rejected. Parents may be dead ends; no route search is done.
 
-        There is no recursion, so a parent that cannot itself be built is still
-        returned (a dead end). A forward check that raises (ambiguous template)
-        rejects that candidate, matching what the forward step itself would do.
-        Edges come back in a canonical order, independent of generation order.
+        _dfs uses the curated reverse templates for route search.
         """
         canonical = molecule.smiles
         signature = typed_dummy_isotopes(molecule.rdmol)
         edges: set[BackwardEdge] = set()
 
-        # 1. Direct FirstSynthon origin: the molecule is itself a catalog brick.
+        # Check whether the molecule is itself a catalog brick.
         if len(signature) == 1:
             library_name = str(signature[0])
             if library_name in self.brick_types:
@@ -377,7 +352,6 @@ class _RetroDFS:
                     )
                     edges.add((action, ""))
 
-        # 2. Unimolecular reverses, each verified forward.
         for _, reaction, action in self.uni_candidates.get(signature, ()):
             for products in reaction.run_inverse(molecule):
                 if len(products) != 1:
@@ -388,7 +362,6 @@ class _RetroDFS:
                 if _forward_reproduces(reaction, canonical, precursor):
                     edges.add((action, precursor.smiles))
 
-        # 3. Bimolecular reverses: recover the oriented synthon and its catalog row.
         for name, reaction in self.bi_candidates.get(signature, ()):
             for child, synthon in self._reverse_birxn(reaction, molecule, complete=True):
                 if typed_dummy_isotopes(child.rdmol) != (reaction.state_type,):
@@ -422,7 +395,7 @@ class _RetroDFS:
 
 
 def _edge_key(edge: BackwardEdge) -> tuple:
-    """Total order over edges, so cached candidate lists are canonical."""
+    """Sort edges consistently before caching."""
     action, parent = edge
     return (
         int(action.action_type),
@@ -471,14 +444,13 @@ def _worker_one_step(smiles: str) -> list[BackwardEdge]:
 
 
 class RetroSynthesisAnalyzer:
-    """Find routes for external SMILES or generated states, locally or in workers.
+    """Search routes locally or in worker processes.
 
-    Search limits default to the environment's generation maxima and can be overridden
-    per call.
-    Results use reverse edge order, ending with FirstSynthon. Searches favor fewer
-    synthons and do not enumerate every route within the limits.
+    Limits default to the environment's generation maxima. Results are
+    reverse-ordered, ending with FirstSynthon. Search favors fewer synthons
+    and may omit routes within the limits.
 
-    `one_step_many` is separate: single reverse steps per molecule, cached by SMILES.
+    one_step_many returns molecule-only candidates without a route search.
     """
 
     def __init__(
@@ -554,10 +526,10 @@ class RetroSynthesisAnalyzer:
         return self.one_step_many([smiles])[0]
 
     def one_step_many(self, smiles_list: Sequence[str]) -> list[tuple[BackwardEdge, ...]]:
-        """Candidate reverse edges for each state, in canonical order.
+        """Return canonical reverse candidates, cached by SMILES in an LRU.
 
-        Results are cached by SMILES (LRU) and misses are computed together, in the
-        worker pool when there is one. The returned tuples are shared with the cache.
+        Cache misses are batched through the worker pool when available.
+        Returned tuples are shared with the cache.
         """
         cache = self._one_step_cache
         found: dict[str, tuple[BackwardEdge, ...]] = {}

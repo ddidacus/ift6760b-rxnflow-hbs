@@ -62,9 +62,8 @@ class SynthonLibrary:
                 raise ValueError(
                     f"{self.name}.{name} has shape {tuple(value.shape)}, expected {shape}"
                 )
-        # Preparation validates molecules, attachment labels and feature values.
-        # Runtime checks only schema/shape, without rescanning every feature or
-        # reparsing every molecule in the trusted prepared catalog.
+        # Preparation validates chemistry and values; runtime checks only schema and
+        # shape.
 
 
 def read_smiles_file(path: Path) -> tuple[list[str], list[str]]:
@@ -109,8 +108,8 @@ def load_synthon_libraries(env_dir: Path) -> dict[str, SynthonLibrary]:
             )
         for path in files:
             smiles, synthon_ids = read_smiles_file(path)
-            # SMILES and features share the row order assigned during preparation.
-            # Keep the catalog in NumPy; only sampled rows become model tensors.
+            # Rows align with prepared features; move only sampled rows from NumPy to
+            # tensors.
             library = SynthonLibrary(
                 name=path.stem,
                 smiles=smiles,

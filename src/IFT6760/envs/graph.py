@@ -122,7 +122,6 @@ def molecule_to_graph_data(molecule: Molecule | None) -> GraphData:
     if sum(atom.GetAtomicNum() == 0 for atom in atoms) > 1:
         raise ValueError("States can have at most one attachment point (dummy atom)")
 
-    # Allocate the graph for heavy atoms and the dummy handle.
     num_nodes = len(atoms)
     node_features = np.empty((num_nodes, NODE_DIM), dtype=np.float32)
     neighbor_shape = (num_nodes, MAX_NEIGHBORS)
@@ -130,17 +129,14 @@ def molecule_to_graph_data(molecule: Molecule | None) -> GraphData:
     neighbor_index = np.zeros(neighbor_shape, dtype=np.int64)
     neighbor_mask = np.zeros(neighbor_shape, dtype=np.bool_)
 
-    # Fill node features.
     for index, atom in enumerate(atoms):
         get_atom_features(atom, out=node_features[index])
 
-    # Fill edge features and neighbor indices.
     index_map = {atom.GetIdx(): index for index, atom in enumerate(atoms)}
     next_slot = [0] * num_nodes
     for bond in rdmol.GetBonds():
         begin_idx, end_idx = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        # Explicit isotopic H atoms can survive RDKit's RemoveHs, but the
-        # model representation only allocates heavy-atom and dummy slots.
+        # RemoveHs can leave isotopic H atoms; the model has no slots for them.
         if begin_idx not in index_map or end_idx not in index_map:
             continue
         begin, end = index_map[begin_idx], index_map[end_idx]
@@ -162,7 +158,6 @@ def molecule_to_graph_data(molecule: Molecule | None) -> GraphData:
         next_slot[begin] += 1
         next_slot[end] += 1
 
-    # Compute graph features
     graph_features = get_mol_features(rdmol)
     num_heavy_atoms = heavy_atom_count(rdmol)
 

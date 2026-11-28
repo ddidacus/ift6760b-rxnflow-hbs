@@ -60,8 +60,8 @@ def _convert_oriented_synthons(env_path: Path, min_library_size: int) -> list[st
     for path in action_dir.iterdir():
         path.unlink()
 
-    # An incoming site is consumed by the action; the outgoing site retains its
-    # chemical type. Equal-type asymmetric linkers can still have two directions.
+    # Consume the incoming site and retain the outgoing type; symmetric types can have two
+    # orientations.
     synthons: dict[str, dict[str, str]] = {}
     synthon_dir = env_path / "synthons"
     for smi_path in sorted(synthon_dir.glob("*.tsv")):
@@ -87,7 +87,7 @@ def _convert_oriented_synthons(env_path: Path, min_library_size: int) -> list[st
                     _outgoing_type = str(outgoing.GetIsotope())
                     library_name = "-".join((_incoming_type, _outgoing_type))
                     library = synthons.setdefault(library_name, {})
-                    _mol = Chem.Mol(mol)  # copy to avoid mutating the original
+                    _mol = Chem.Mol(mol)
                     _mol.GetAtomWithIdx(incoming.GetIdx()).SetIsotope(0)
                     oriented_smiles = Chem.MolToSmiles(_mol)
                     library[oriented_smiles] = synthon_id

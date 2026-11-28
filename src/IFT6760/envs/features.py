@@ -25,7 +25,6 @@ def _get_index(value: object, choices: tuple, *, allow_unk: bool) -> int:
         raise ValueError(f"Unknown feature value {value!r}") from None
 
 
-# === Atom features === #
 ATOM_FEATURE_DICT = {
     "type": (0, 5, 6, 7, 8, 9, 14, 15, 16, 17, 35, 53),
     "degree": (0, 1, 2, 3, 4, 5),
@@ -89,7 +88,6 @@ def get_atom_features(atom: Chem.Atom, out: np.ndarray | None = None) -> np.ndar
     return out
 
 
-# === Bond features === #
 BOND_FEATURE_DICT = {
     "bond_type": (
         Chem.BondType.SINGLE,
@@ -130,7 +128,6 @@ def get_bond_features(bond: Chem.Bond, out: np.ndarray | None = None) -> np.ndar
     return out
 
 
-# === Molecule features === #
 
 PROPERTY_DIM = 9
 PROPERTY_NAMES = (
@@ -202,7 +199,6 @@ def get_mol_features(mol: Chem.Mol | None, out: np.ndarray | None = None) -> np.
     return out
 
 
-# === Synthon features === #
 FINGERPRINT_DIM = 512 + 166
 _MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=512)
 
@@ -210,9 +206,7 @@ _MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=5
 def synthon_fingerprint(mol: Chem.Mol) -> np.ndarray:
     """Concatenate isotope-aware Morgan counts and MACCS bits into 678 bytes."""
     invariants = rdMolDescriptors.GetConnectivityInvariants(mol)
-    # Default Morgan invariants ignore dummy isotopes. Supply the categorical
-    # label explicitly, so active/latent types and their positions remain
-    # visible to the synthon encoder (without fake atom masses).
+    # Morgan defaults ignore dummy isotopes; include site labels in the invariants.
     for atom in mol.GetAtoms():
         if atom.GetAtomicNum() == 0:
             invariants[atom.GetIdx()] = atom.GetIsotope()

@@ -19,11 +19,7 @@ from .nn import mlp
 
 
 class RxnFlowModel(nn.Module):
-    """RxnFlow model
-
-    With a learned backward policy (`backward.mode == "learned"`) the model also owns a
-    `BackwardHead`; otherwise it is exactly the RxnFlow v2.1.1 model.
-    """
+    """RxnFlow model with an optional learned backward head."""
 
     def __init__(
         self,
@@ -37,7 +33,6 @@ class RxnFlowModel(nn.Module):
         self.num_objectives: int = num_objectives
         self.condition_dim: int | None = condition_dim
 
-        # State encoder
         self.state_encoder = MPNN(
             node_dim=NODE_DIM,
             edge_dim=EDGE_DIM,
@@ -46,9 +41,7 @@ class RxnFlowModel(nn.Module):
             num_layers=cfg.num_state_layers,
         )
 
-        # GFN condition encoders, i.e., temperature and preference vector
         self.gfn_condition_encoder = GFNConditionEncoder(num_objectives, cfg.hidden_dim)
-        # External condition encoder
         if condition_dim is not None:
             self.condition_encoder = ExternalConditionEncoder(
                 condition_dim, cfg.hidden_dim
@@ -59,14 +52,12 @@ class RxnFlowModel(nn.Module):
 
         state_dim = cfg.state_dim + cond_dim
 
-        # Reaction name embeddings
         reaction_names = list(env.uni_reactions.keys()) + list(env.bi_reactions.keys())
         self.rxn_embedding = nn.ParameterDict(
             (name, nn.Parameter(torch.empty(cfg.hidden_dim))) for name in reaction_names
         )
         rxn_dim = cfg.hidden_dim
 
-        # Synthon encoder
         self.synthon_encoder = SynthonEncoder(
             num_types=len(env.synthon_types) + 1,
             hidden_dim=cfg.synthon_dim,
@@ -74,7 +65,6 @@ class RxnFlowModel(nn.Module):
         )
         synthon_dim = cfg.synthon_dim
 
-        # Action heads
         hidden_dim = cfg.hidden_dim
 
         def _action_mlp(in_dim, out_dim):
@@ -89,14 +79,11 @@ class RxnFlowModel(nn.Module):
         }
         self.action_heads = nn.ModuleDict({k.name: v for k, v in action_heads.items()})
 
-        # Logit scaling (LogitGFN)
         self._logit_scale = mlp(cond_dim, hidden_dim, d_out=1, n_layer=2)
 
-        # Trajectory-balance (TB)
         self._logZ = mlp(cond_dim, hidden_dim, d_out=1, n_layer=2)
 
-        # Backward head (learned P_B only). Created last, so the initialisation of every
-        # other module is identical to the baseline model.
+        # Create P_B last to preserve baseline initialization of the other modules.
         self.backward_head: BackwardHead | None = None
         if backward is not None and backward.learned:
             self.backward_head = BackwardHead(
@@ -110,8 +97,8 @@ class RxnFlowModel(nn.Module):
         self.init_weight()
 
     def init_weight(self) -> None:
-        # Keep policy outputs nonzero so both dot-product branches receive
-        # gradients from the first update. All Linear layers share this rule.
+        # Nonzero outputs let both dot-product branches receive gradients on the first
+        # update.
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -137,7 +124,6 @@ class RxnFlowModel(nn.Module):
         return F.elu(self._logit_scale(cond)).squeeze(-1) + 1
 
     def logZ(self, cond: torch.Tensor) -> torch.Tensor:
-        """Predict logZ from the full GFN and external condition embedding."""
         return self._logZ(cond)
 
     def encode_cond(
@@ -160,7 +146,6 @@ class RxnFlowModel(nn.Module):
         return torch.cat([gfn_cond_emb, ext_cond_emb], dim=-1)
 
     def encode_state(self, batch: GraphBatch) -> torch.Tensor:
-        """Encode a molecule graphs into state embeddings."""
         return self.state_encoder(batch)
 
     def encode_synthon(
@@ -169,15 +154,13 @@ class RxnFlowModel(nn.Module):
         prop: torch.Tensor,
         types: torch.Tensor,
     ) -> torch.Tensor:
-        """fp: [n, d_fp], prop: [n, d_prop], types: [n, 2]
-        return [n, d_synthon]."""
+        """fp: [N, F], prop: [N, P], types: [N, 2]; return [N, synthon_dim]."""
         return self.synthon_encoder(fp, prop, types)
 
     def forward_first_synthon(
         self,
         state_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Map conditioned state embeddings to first-synthon queries."""
         head = self.action_heads[ActionType.FIRST_SYNTHON.name]
         return head(state_emb)
 

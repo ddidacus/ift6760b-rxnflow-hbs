@@ -47,9 +47,7 @@ class SynthonConversion:
 
 
 def get_dummy_atoms(mol: Chem.Mol) -> tuple[Chem.Atom, ...]:
-    """Return dummy atoms."""
-    # Match in RDKit to avoid Python wrappers for non-dummy atoms. The atom
-    # count bounds all possible matches without truncating large molecules.
+    # Match in RDKit to avoid wrapping every atom; do not truncate large molecules.
     return tuple(
         mol.GetAtomWithIdx(index)
         for (index,) in mol.GetSubstructMatches(_DUMMY_ATOM, maxMatches=mol.GetNumAtoms())

@@ -50,7 +50,6 @@ def _convert_batch(
 
     conversions = _get_conversions(tuple(templates.items()))
 
-    # 1. Convert each building block into bricks.
     # One synthon can be obtained from multiple building blocks; we keep all source IDs.
     brick_dict: dict[int, dict[str, list[str]]] = {}
     for conversion in conversions:
@@ -60,9 +59,8 @@ def _convert_batch(
                 bricks.setdefault(brick_smi, []).append(identifier)
         brick_dict[conversion.synthon_type] = bricks
 
-    # 2. Convert each unique brick to linkers. Keep both conversion orders:
-    # removing one functional group can change the other template's match.
-    # Sorted isotope pairs group both conversion orders into the same library.
+    # Try both conversion orders: removing one group can change the next match.
+    # Group the resulting linkers by sorted isotope pairs.
     linker_dict: dict[tuple[int, int], dict[str, set[str]]] = {}
     for left_type, bricks in brick_dict.items():
         for brick_smi, identifiers in bricks.items():
@@ -77,7 +75,6 @@ def _convert_batch(
                     linkers = linker_dict.setdefault(expected, {})
                     linkers.setdefault(linker_smi, set()).update(identifiers)
 
-    # 3. Filter completed synthons while retaining their chemical site types.
     def _is_valid(mol: Chem.Mol) -> bool:
         """Apply size and functional-group filters to a completed brick or linker."""
         return mol.GetNumHeavyAtoms() <= max_atoms and not any(
@@ -117,7 +114,6 @@ def convert_synthons(
     logger.info("Preparing synthons: workers=%s, max_atoms=%s", num_workers, max_atoms)
     if max_atoms < 1:
         raise ValueError("The max_atoms value must be at least 1")
-    # 1. Load cleaned building blocks, conversion rules, and exclusions.
     env_path = Path(env_dir)
     with (env_path / "building_blocks.smi").open() as f:
         records = [tuple(line.rstrip("\n").split("\t")) for line in f]
@@ -134,8 +130,7 @@ def convert_synthons(
     )
     synthons: dict[str, dict[str, set[str]]] = {}
 
-    # 2. Convert batches and merge source IDs for duplicate synthons.
-    # Batch conversion bounds worker input size; sorted output makes IDs deterministic.
+    # Bound worker input with batches; sort output for deterministic IDs.
     logger.info("Converting %d building blocks in 512-row batches", len(records))
     batches = (records[i : i + 512] for i in range(0, len(records), 512))
     convert = partial(
@@ -160,7 +155,6 @@ def convert_synthons(
                 for smiles, identifiers in values.items():
                     target.setdefault(smiles, set()).update(identifiers)
 
-    # 3. Assign canonical synthon IDs and save building-block provenance.
     synthon_dir = env_path / "synthons"
     synthon_dir.mkdir(exist_ok=True)
     # Remove rows left by an interrupted write before rebuilding this stage.
@@ -168,8 +162,7 @@ def convert_synthons(
         path.unlink()
     for library_name, values in sorted(synthons.items()):
         output = synthon_dir / f"{library_name}.tsv"
-        # Source IDs define the primary order; SMILES break ties when the same
-        # building blocks yield several synthons of the same type.
+        # Sort by source IDs, then SMILES to break ties.
         rows = sorted(values, key=lambda smiles: (tuple(sorted(values[smiles])), smiles))
         with output.open("w") as w:
             w.write("synthon_id\tsmiles\tbb_ids\n")

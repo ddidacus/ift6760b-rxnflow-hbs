@@ -49,7 +49,6 @@ class SubsamplingConfig:
 class RewardConfig:
     """Reward transformation and constructor settings."""
 
-    # Reward exponent and preference sampling specifications.
     beta: tuple[str, list[float]] = field(default_factory=lambda: ("fixed", [32.0]))
     moo_preference: tuple[str, list[float]] = field(default_factory=lambda: ("none", []))
     moo_scalarization: Literal["sum", "mul"] = "mul"
@@ -192,11 +191,11 @@ class TrainingConfig:
 
 @dataclass
 class BackwardConfig:
-    """P_B types:
+    """Backward policy settings.
 
-    heuristic - RXNFlow's default (recursive backward search).
-    learned scores the one-step reverse candidates of each state using nn
-        objective` picks how that head is trained (`none` keeps P_B uniform over the candidates).
+    heuristic uses RxnFlow's recursive route search. learned scores one-step
+    reverse candidates; objective selects MLE, REINFORCE, or a frozen uniform
+    policy (none).
     """
 
     mode: Literal["heuristic", "learned"] = "heuristic"
@@ -204,11 +203,10 @@ class BackwardConfig:
     mle_weight: float = 1.0
     reinforce_weight: float = 1.0
     entropy_weight: float = 1.0
-    # A rollout scores +1 when its route is a forward trajectory and this value otherwise.
+    # Reward for backward walks that fail to reach the empty state.
     illegal_reward: float = -1.0
-    # stop the P_B loss from updating the encoders shared with the forward policy.
+    # Detach encoders shared with P_F when computing the P_B loss.
     detach_shared: bool = False
-    # lr of the backward head;
     learning_rate: float | None = None
     # Number of one-step candidate lists kept in the LRU cache.
     cache_size: int = 200_000
@@ -246,11 +244,7 @@ class BackwardConfig:
 
 @dataclass
 class Config:
-    """Top-level runtime configuration.
-
-    The resolved dictionary is embedded in every checkpoint, including the
-    heavy-atom capacity and action-space subsampling parameters.
-    """
+    """Runtime configuration, saved in each checkpoint."""
 
     env_dir: str = ""
     reward: RewardConfig = field(default_factory=RewardConfig)
@@ -271,8 +265,7 @@ class Config:
         unknown = set(self.property_penalty) - set(PROPERTY_PENALTY_INDICES)
         if unknown:
             raise ValueError(f"unknown property_penalty properties: {sorted(unknown)}")
-        # Zero is useful for counts (e.g. no rings/HBD).
-        # These are upper bounds, so positivity is not a general requirement.
+        # Zero is a valid upper bound, e.g. for rings or hydrogen-bond donors.
         if any(not math.isfinite(value) for value in self.property_penalty.values()):
             raise ValueError("property_penalty values must be finite")
         self.subsampling.validate()
@@ -340,9 +333,10 @@ class Config:
 
     @classmethod
     def from_file(cls, path: str | Path, overrides: Sequence[str] = ()) -> Config:
-        """Load a YAML file; `overrides` are dotted `key=value` settings applied on top
-        (e.g. `backward.learning_rate=0.003`). Write floats as 0.003 or 3.0e-3."""
-        # 1. Load the user-facing YAML settings.
+        """Load YAML with optional dotted key=value overrides.
+
+        For example, backward.learning_rate=0.003. Use 0.003 or 3.0e-3 for floats.
+        """
         base = OmegaConf.create(cls().to_dict())
         settings = OmegaConf.load(path)
         if overrides:
@@ -351,7 +345,6 @@ class Config:
         if not isinstance(loaded, dict):
             raise ValueError("configuration file must contain a mapping")
         normalized = loaded
-        # 2. Parse condition strings once, before constructing numeric config.
         reward = normalized.get("reward")
         if reward is not None:
             if not isinstance(reward, dict):
@@ -364,7 +357,6 @@ class Config:
         property_penalty = normalized.get("property_penalty")
         if property_penalty is not None and not isinstance(property_penalty, dict):
             raise ValueError("property_penalty must be a mapping")
-        # 3. Merge omitted defaults and validate the resolved configuration.
         merged = OmegaConf.merge(base, normalized)
         raw = OmegaConf.to_container(merged, resolve=True)
         assert isinstance(raw, dict)

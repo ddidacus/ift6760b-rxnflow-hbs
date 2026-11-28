@@ -15,5 +15,5 @@ wandb/
 *.log
 
 
-experiments/
-tests/
+/experiments/
+/tests/

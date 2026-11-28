@@ -119,11 +119,10 @@ class ActionCategorical:
     def sample(
         self, softmax_temperature: float, random_action_prob: float, importance: float
     ) -> list[Action]:
-        """Draw one action per state from the exploration distribution.
+        """Draw one action per state using exploration scores.
 
-        Add importance * log(N/K) to sampled synthon logits, then divide by
-        softmax_temperature. random_action_prob selects states that use
-        subspace-balanced random scores instead of model scores.
+        Add importance * log(N/K) to synthon logits and divide by softmax_temperature.
+        random_action_prob switches selected states to subspace-balanced random scores.
         """
         device = self.device
         random_states = (
@@ -243,26 +242,21 @@ class RxnFlowPolicy:
         *,
         apply_property_penalty: bool = False,
     ) -> ActionCategorical:
-        """Readable reference for constructing the forward action distribution.
+        """Reference implementation of forward scoring, one state at a time.
 
-        Scores sampled candidates state by state; production paths use
-        get_action_categorical to batch the same computation.
+        get_action_categorical batches the same computation for training and sampling.
         """
         assert states
-        # 1. Late conditioning: h(s, c) = concat(encode_state(s), encode_cond(c)).
-        # The graph encoder is independent of beta, preference and external features.
+        # Late conditioning keeps graph encodings independent of beta and preferences.
         batch = self._get_state_inputs(states).to(self.device)
         state_emb = self.model.encode_state(batch)
         cond_emb = self.model.encode_cond(beta, preference, cond)
         action_emb = torch.cat([state_emb, cond_emb], dim=-1)
         logit_scale = self.model.logit_scale(cond_emb)
 
-        # 2. Share sampled candidates and their synthon encodings across states.
         action_spaces = self._prepare_action_space(states)
         synthon_cache = self._get_synthon_cache(action_spaces)
 
-        # 3. Compute unnormalized action scores f_theta(s, a | c).
-        # Synthon actions use query(h) dot encode_synthon(a); unirxn uses a scalar head.
         action_logits: list[list[ActionLogits]] = []
         for state_i, action_space in enumerate(action_spaces):
             emb = action_emb[state_i]
@@ -275,13 +269,10 @@ class RxnFlowPolicy:
                 action_name, library_name = subspace.name
                 action_type = subspace.action_type
                 if action_type.is_unirxn:
-                    # Unimolecular reactions have one action per subspace
                     logits = self._unirxn_logits(action_type, action_name, emb)
                     action_mask = None
                 else:
-                    # FirstSynthon and BiReactions have multiple actions per subspace.
                     synthon_emb, synthon_prop, synthon_size = synthon_cache[library_name]
-                    # Compute the logits for the sampled synthons in this subspace.
                     if action_type.is_first:
                         logits = self._first_synthon_logits(emb, synthon_emb)
                     else:
@@ -289,7 +280,6 @@ class RxnFlowPolicy:
                             action_type, action_name, emb, synthon_emb
                         )
 
-                    # Apply property penalty to the logits
                     if apply_property_penalty:
                         size_mask = get_size_mask(
                             state_size, synthon_size, self.env.max_atoms
@@ -301,10 +291,8 @@ class RxnFlowPolicy:
                     else:
                         action_mask = None
 
-                # Scale the logits
                 logits = logits * scale
 
-                # Mask out invalid actions
                 if action_mask is not None:
                     logits.masked_fill_(~action_mask, -torch.inf)
 
@@ -322,11 +310,9 @@ class RxnFlowPolicy:
         *,
         apply_property_penalty: bool = False,
     ) -> ActionCategorical:
-        # 1. Prepare sampled synthons before scoring.
         action_spaces = self._prepare_action_space(states)
         synthon_cache = self._get_synthon_cache(action_spaces)
 
-        # 2. Group states by attachment type
         state_groups: dict[int | None, list[int]] = {}
         for state_i, state in enumerate(states):
             assert action_spaces[state_i]
@@ -347,8 +333,7 @@ class RxnFlowPolicy:
                 key = (subspace.action_type, subspace.name[0])
                 spaces_by_action.setdefault(key, []).append(subspace)
 
-            # Reaction embeddings differ, but reactions of the same action type
-            # use one shared MLP. Batch that MLP while retaining library scoring.
+            # Batch the shared MLP across reactions, then score each library separately.
             reaction_queries: dict[tuple[ActionType, str], torch.Tensor] = {}
             for action_type in (
                 ActionType.UNIRXN_TRANSFORM,
@@ -362,8 +347,8 @@ class RxnFlowPolicy:
                     for name, query in zip(names, queries.unbind(0), strict=True):
                         reaction_queries[action_type, name] = query
 
-            # 3. Sampling uses approximate size/property limits. TB evaluates
-            # the unmasked policy and learns property preferences from rewards.
+            # Apply size/property masks during sampling; TB uses unmasked logits and
+            # terminal rewards.
             library_names = list(
                 dict.fromkeys(
                     space.name[1]
@@ -385,7 +370,6 @@ class RxnFlowPolicy:
                 masks = (size_mask & property_penalty).split(widths, dim=1)
                 library_masks = dict(zip(library_names, masks, strict=True))
 
-            # 4. One head call and matrix product for all of its library candidates.
             group_logits: dict[ActionKey, tuple[torch.Tensor, ...]] = {}
             for (action_type, action_name), spaces in spaces_by_action.items():
                 if action_type.is_unirxn:
@@ -409,7 +393,7 @@ class RxnFlowPolicy:
                 ):
                     group_logits[subspace.name] = values.unbind(0)
 
-            # 5. Preserve each state's budget eligibility and original subspace order.
+            # Keep each state's budget eligibility and original subspace order.
             for local_row, state_i in enumerate(rows):
                 action_logits[state_i] = [
                     ActionLogits(subspace, group_logits[subspace.name][local_row])
@@ -426,7 +410,7 @@ class RxnFlowPolicy:
             sampled_space: ActionSpace = []
             for subspace in self.env.get_action_space(state):
                 library_name = subspace.name[1]
-                if library_name is None:  # Unimolecular reactions.
+                if library_name is None:
                     sampled_space.append(subspace)
                     continue
                 if library_name not in samples:
@@ -464,15 +448,13 @@ class RxnFlowPolicy:
         for library_name, indices in samples.items():
             library = self.env.synthons[library_name]
             rows = slice(offset, offset + len(indices))
-            # Subsampling supplies valid indices. Clip mode lets take write directly
-            # into the final buffer without the temporary used by raise mode.
+            # Indices are valid; clip mode avoids the temporary buffer used by raise mode.
             np.take(library.fingerprints, indices, axis=0, out=fp_arr[rows], mode="clip")
             np.take(library.properties, indices, axis=0, out=prop_arr[rows], mode="clip")
             np.take(library.heavy_atoms, indices, out=size_arr[rows], mode="clip")
             type_arr[rows] = self.env.library_site_indices[library_name]
             offset += len(indices)
 
-        # Transfer to device.
         fp = torch.from_numpy(fp_arr).to(
             self.device, dtype=torch.float32, non_blocking=True
         )
@@ -530,14 +512,12 @@ class RxnFlowPolicy:
         Group heads by (action type, name) and synthon features by library.
         Observed actions are scored even if absent from the denominator sample.
         """
-        # 1. Group observed rows while retaining their original batch positions.
         by_reaction, by_library = {}, {}
         for row, action in enumerate(actions):
             name = "" if action.action_type.is_first else action.reaction
             by_reaction.setdefault((action.action_type, name), []).append(row)
             if action.library_name is not None:
                 by_library.setdefault(action.library_name, []).append(row)
-        # 2. Gather and encode only the synthons selected by those actions.
         synthon_rows, features = [], []
         for name, rows in by_library.items():
             indices = np.array([actions[i].synthon_index for i in rows], dtype=np.int64)
@@ -552,7 +532,6 @@ class RxnFlowPolicy:
             synthons = synthons.index_copy(
                 0, torch.tensor(synthon_rows, device=self.device), values
             )
-        # 3. Score each action group and restore the original batch order.
         logits = state_emb.new_zeros(len(actions))
         for (action_type, action_name), rows in by_reaction.items():
             indices = torch.tensor(rows, device=self.device)
@@ -609,8 +588,7 @@ class RxnFlowPolicy:
         preference: torch.Tensor,
         cond: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # The masked sampler is an exploration policy. TB uses the same
-        # unmasked logits in its numerator and normalization estimate.
+        # TB uses unmasked logits for both the numerator and partition estimate.
         assert states
         batch = self._get_state_inputs(states).to(self.device)
         state_emb = self.model.encode_state(batch)
@@ -618,10 +596,8 @@ class RxnFlowPolicy:
         state_emb = torch.cat([state_emb, cond_emb], dim=-1)
         logit_scale = self.model.logit_scale(cond_emb)
 
-        # Compute the selected action logits
         action_logits = self.get_action_logits(state_emb, actions, logit_scale)
 
-        # Compute the log partition function
         log_partitions = self.get_action_categorical(
             states, batch, state_emb, logit_scale
         ).log_partition()
@@ -636,14 +612,14 @@ class RxnFlowPolicy:
     ) -> float | None:
         """Normalize synthon-count-weighted route mass for the observed reverse edge."""
         # This is an explicit route preference, independent of catalog size.
-        # TODO: Review backward consistency with trajectory limits and search
+        # TODO: Check backward consistency under trajectory limits and search
         # approximation.
         log_penalty = math.log(self.config.training.backward_synthon_penalty)
         numerator = denominator = -math.inf
         for trajectory in trajectories:
             num_synthons = sum(not edge.action_type.is_unirxn for edge, _ in trajectory)
-            # Every complete route includes FirstSynthon. Subtract its common
-            # count; extra UniReactions leave the route's weight unchanged.
+            # Subtract the shared FirstSynthon count; extra UniReactions do not affect
+            # route weight.
             log_weight = -(num_synthons - 1) * log_penalty
             denominator = np.logaddexp(denominator, log_weight)
             if trajectory[0] == (action, parent_smiles):
@@ -669,7 +645,6 @@ class RxnFlowPolicy:
         cond contains encoded features [count, condition_dim]; cond_list retains
         the corresponding raw values for reward evaluation and replay.
         """
-        # 1. Initialize trajectory state and keep conditions fixed for every step.
         if count <= 0:
             raise ValueError("sample count must be positive")
         assert beta.shape == (count,)
@@ -679,14 +654,12 @@ class RxnFlowPolicy:
             assert len(cond_list) == count
             assert cond.shape == (count, self.model.condition_dim)
             cond = cond.to(self.device)
-        # Retain condition values for serialization at termination.
         beta_values, preference_values = beta.tolist(), preference.tolist()
         beta, preference = beta.to(self.device), preference.to(self.device)
         states = [self.env.initial_state() for _ in range(count)]
         steps: list[list[Transition]] = [[] for _ in range(count)]
         reasons: list[InvalidReason | None] = [None] * count
-        # The empty state has one zero-action path. Every selected forward edge
-        # prepends to its parent's paths before submitting the next reverse search.
+        # Seed each reverse search by prepending the generated edge to its parent routes.
         backward_trajectories: list[list[BackwardTrajectory]] = [
             [[]] for _ in range(count)
         ]
@@ -694,9 +667,8 @@ class RxnFlowPolicy:
         def collect_backward() -> None:
             for index, routes in self.env.retro_analyzer.result():
                 transition = steps[index][-1]
-                # Approximate backward mass includes shorter chemical routes,
-                # even when their counters differ from the generated history.
-                # Forward action selection still enforces both synthesis budgets.
+                # Heuristic backward mass includes shorter routes with different counters.
+                # Forward sampling still enforces both synthesis budgets.
                 value = self.calc_bck_logprob(
                     transition.action, routes, transition.state.smiles
                 )
@@ -705,7 +677,6 @@ class RxnFlowPolicy:
                 transition.log_p_B = value
                 backward_trajectories[index] = routes
 
-        # 2. Advance active trajectories: FirstSynthon plus max_reactions reactions.
         for _ in range(self.env.max_reactions + 1):
             active = [
                 i
@@ -722,16 +693,14 @@ class RxnFlowPolicy:
                 softmax_temperature=softmax_temperature,
                 random_action_prob=random_action_prob,
             )
-            # Collect the preceding reverse search after forward sampling so
-            # worker processes can overlap it with model computation. Parent
-            # routes must be ready before the next transition is submitted.
+            # Overlap reverse search with forward sampling; collect parent routes before
+            # submitting the next step.
             if analyze_backward:
                 collect_backward()
             for index, action in zip(active, selected, strict=True):
                 state = states[index]
-                # Preserve the sampled action even when chemistry fails. Its
-                # forward probability must receive the invalid-reward TB signal;
-                # dropping it would train only the prefix that reached this state.
+                # Keep failed actions so TB penalizes the sampled failure as well as its
+                # prefix.
                 try:
                     next_state = self.env.step(state, action)
                 except InvalidTransition:
@@ -749,15 +718,14 @@ class RxnFlowPolicy:
                         [
                             [(action, state.smiles), *route]
                             for route in backward_trajectories[index]
-                            # Allow different lengths, but do not extend an
-                            # alternative beyond the configured reaction cap.
+                            # Alternative routes may differ in length but must respect the
+                            # reaction cap.
                             if len(route) <= self.env.max_reactions
                         ],
                     )
 
-        # 3. Finish pending analysis, then serialize successes and failed attempts.
         if analyze_backward:
-            collect_backward()  # Drain terminal states and the final pending batch.
+            collect_backward()
 
         trajectories = []
         for index, state in enumerate(states):

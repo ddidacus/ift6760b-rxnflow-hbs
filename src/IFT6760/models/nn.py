@@ -14,10 +14,10 @@ def mlp(
     layernorm: bool = False,
     dropout: float = 0.0,
 ) -> nn.Sequential:
-    """Build n_layer Linear layers, including the output layer.
+    """Build n_layer linear layers, counting the output layer.
 
-    Hidden blocks use Linear → optional LayerNorm → activation → optional
-    dropout. With n_layer=1, this is a single Linear(d_in, d_out).
+    Hidden layers use optional LayerNorm, activation, and optional dropout.
+    n_layer=1 gives a single Linear(d_in, d_out).
     """
     assert n_layer >= 1
     modules = []

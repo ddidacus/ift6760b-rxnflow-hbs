@@ -30,8 +30,7 @@ def prepare_metadata(config_path: str | Path, env_dir: str | Path) -> None:
     if config.get("exclude_actions"):
         paths["exclude_actions"] = config_path.parent / config["exclude_actions"]
 
-    # Each conversion produces one typed site. Other existing sites are checked
-    # on actual products during linker conversion, where their context is known.
+    # Check other sites on actual linker products, where their context is known.
     templates = load_synthon_templates(paths["synthon"])
     for synthon_type, patterns in templates.items():
         conversion = SynthonConversion(synthon_type, *patterns)
@@ -46,8 +45,7 @@ def prepare_metadata(config_path: str | Path, env_dir: str | Path) -> None:
         _, errors = reaction.Validate(silent=True)
         if errors:
             raise ValueError(f"Synthon {synthon_type}: invalid reaction SMARTS")
-        # A mapped, unlabelled wildcard (e.g. [*:2]) preserves a reactant atom;
-        # it does not introduce a dummy. Count new dummies and explicit labels.
+        # Mapped wildcards such as [*:2] preserve atoms; they do not create dummies.
         sites = [
             atom.GetIsotope()
             for atom in conversion.product_pattern.GetAtoms()
@@ -59,8 +57,7 @@ def prepare_metadata(config_path: str | Path, env_dir: str | Path) -> None:
                 f"Synthon {synthon_type}: expected exactly one declared dummy site"
             )
 
-    # Reaction constructors check SMARTS shape and site labels. Here we also
-    # ensure every referenced type is defined by the synthon templates.
+    # Constructors validate SMARTS; also check that all referenced types are defined.
     uni, bi = load_reactions(paths["reaction"])
     for reaction in uni.values():
         types = {reaction.input_type}
@@ -90,7 +87,6 @@ def prepare_metadata(config_path: str | Path, env_dir: str | Path) -> None:
     if "exclude_actions" in paths:
         load_action_exclusions(paths["exclude_actions"], bi, set(templates))
 
-    # Snapshot templates only after all definitions pass.
     env_path.mkdir(parents=True, exist_ok=True)
     if "exclude_substructures" not in paths:
         (env_path / "exclude_substructures.yaml").unlink(missing_ok=True)

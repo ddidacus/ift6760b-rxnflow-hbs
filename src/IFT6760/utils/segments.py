@@ -1,8 +1,7 @@
-"""Softmax, entropy and sampling over variable-size candidate sets.
+"""Softmax, entropy, and sampling over variable-size candidate sets.
 
-A batch of decisions is stored as one flat tensor of scores with the candidates of each
-decision contiguous. Candidate sets are tiny (a handful of reverse steps per molecule), so
-the simplest correct representation is a padded dense matrix [decisions, max candidates].
+Candidates are contiguous in a flat tensor. Dense operations use a padded
+[decisions, max candidates] matrix.
 """
 
 from __future__ import annotations

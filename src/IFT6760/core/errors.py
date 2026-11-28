@@ -7,11 +7,10 @@ class InvalidTransition(ValueError):
 
 
 class MissingReverseEdge(ValueError):
-    """`one_step` did not return the edge that produced a state.
+    """The generated forward edge is missing from the reverse candidates.
 
-    P_B is a distribution over the one-step reverse candidates of a state, so the edge the
-    forward policy took must be one of them. When it is not, the step cannot be scored and
-    a backward walk could never reproduce it: the candidate generator is at fault.
+    This prevents P_B from scoring or sampling that step and indicates a
+    candidate-generation error.
     """
 
     def __init__(self, product_smiles: str, action: object, parent: str):

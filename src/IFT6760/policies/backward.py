@@ -1,13 +1,7 @@
-"""Learned backward policy P_B over one-step reverse candidates.
+"""Learned P_B over one-step reverse candidates.
 
-For a molecule s', the candidates C(s') are its single reverse steps (action, parent),
-produced by `RetroSynthesisAnalyzer.one_step_many`. P_B(e | s') is a softmax over C(s') of
-the scores from `model.backward_head`.
-
-Candidates are a pure function of the molecule, so they are cached by SMILES rather than
-stored on trajectories or in the replay buffer. Parents that cannot be built from the
-catalog are candidates too; learning to avoid them is the point of the backward objectives
-(see `objectives/backward.py`).
+Molecule-only candidates are cached by SMILES, then filtered by state counters.
+Parents may be dead ends; the backward objectives train P_B to avoid them.
 """
 
 from __future__ import annotations
@@ -30,7 +24,7 @@ from IFT6760.utils.segments import Segments
 
 @dataclass
 class Decisions:
-    """States to score, each with the reverse steps available from it."""
+    """States and their reverse candidates."""
 
     smiles: list[str]
     edges: list[tuple[BackwardEdge, ...]]
@@ -41,7 +35,7 @@ class Decisions:
 
 @dataclass
 class ObservedBatch:
-    """The decisions forward trajectories faced, with the edge they took marked."""
+    """Forward decisions with the observed edge index for each."""
 
     decisions: Decisions
     observed: torch.Tensor  # [N] index of the generated edge within its candidates
@@ -50,7 +44,7 @@ class ObservedBatch:
 
 @dataclass
 class Rollouts:
-    """Backward walks sampled from P_B, one per start molecule."""
+    """Backward walks sampled from P_B."""
 
     log_prob: torch.Tensor  # [N] sum of log P_B along each walk (keeps its gradient)
     entropy: torch.Tensor  # [M] entropy of P_B at every visited state (keeps gradient)
@@ -62,8 +56,6 @@ class Rollouts:
 
 @dataclass
 class _Walk:
-    """One backward walk's own bookkeeping, kept out of the tensor accumulators."""
-
     smiles: str
     reactions: int  # counters still to undo; the walk is home when both reach zero
     synthons: int
@@ -71,12 +63,9 @@ class _Walk:
     route: list[BackwardEdge] = field(default_factory=list)
 
     def take(self, edge: BackwardEdge, env: SynthesisEnv) -> bool:
-        """Follow `edge` and report whether the walk is still running.
+        """Follow edge, update the counters, and return whether the walk continues.
 
-        The walk carries the counters of the state it started from and decrements them,
-        so `SynthesisEnv.parent_counts` is the same test here as for a trajectory step.
-        Reaching the empty state therefore means the counters arrived at zero: the route
-        spends exactly what the recorded one did, and no separate legality test is needed.
+        Success requires reaching the empty state with both counters at zero.
         """
         action, parent = edge
         counts = env.parent_counts(action, self.reactions, self.synthons)
@@ -126,11 +115,9 @@ class BackwardPolicy:
         return graph
 
     def encode(self, smiles: list[str], chunk: int = 96) -> torch.Tensor:
-        """State-encoder embeddings, [len(smiles), state_dim]; repeats are encoded once.
+        """Return [len(smiles), state_dim] embeddings, encoding repeats once.
 
-        Unique states are sorted by size before batching: the encoder pads every graph in
-        a batch up to the largest one, so grouping similar sizes avoids most of that
-        wasted work. Padding is masked, so the embeddings do not depend on the batching.
+        Batch unique states by size to reduce graph padding.
         """
         unique = sorted(dict.fromkeys(smiles), key=lambda s: self._graph(s).num_nodes)
         embeddings = torch.cat(
@@ -148,10 +135,7 @@ class BackwardPolicy:
         return embeddings[rows]
 
     def _reaction_embeddings(self, edges: list[BackwardEdge]) -> torch.Tensor:
-        """The forward policy's reaction embedding per edge, [E, rxn_dim].
-
-        FirstSynthon edges carry no reaction, so they index an appended zero row.
-        """
+        """Return reaction embeddings [E, rxn_dim], with zeros for FirstSynthon."""
         table = torch.stack([self.model.rxn_embedding[name] for name in self._rxn_names])
         table = torch.cat([table, table.new_zeros(1, table.shape[1])])
         no_reaction = len(self._rxn_names)
@@ -159,10 +143,9 @@ class BackwardPolicy:
         return table[torch.tensor(rows, device=self.device)]
 
     def _synthon_embeddings(self, edges: list[BackwardEdge]) -> torch.Tensor:
-        """Normalised embedding of each edge's removed synthon, [E, synthon_dim].
+        """Return normalized synthon embeddings [E, synthon_dim].
 
-        Unimolecular edges remove nothing and keep a zero row. Synthons are looked up one
-        library at a time, since their features are stored per library.
+        Unimolecular edges get zeros. Features are loaded one library at a time.
         """
         out = torch.zeros(len(edges), self.config.model.synthon_dim, device=self.device)
         rows_by_library: dict[str, list[int]] = {}
@@ -224,17 +207,9 @@ class BackwardPolicy:
         return seg.log_softmax(scores), seg
 
     def observed(self, trajectories: list[Trajectory]) -> ObservedBatch:
-        """One decision per step that produced a molecule, with its generated edge located.
+        """Locate each generated edge among candidates allowed by the state counters.
 
-        Here the state's counters are known, so the candidates are filtered to the genuine
-        parents of `(molecule, reactions, synthons)`: P_B is normalised over those rather
-        than over the reverse steps of the molecule alone, which would spread mass onto
-        parents unreachable at these counts. Undoing the generated action always yields a
-        legal parent, so the mask can never hide it.
-
-        The generator must still rediscover that edge. A violation raises
-        `MissingReverseEdge` rather than being patched over, because scoring an edge the
-        walk could never sample trains on a distribution that does not exist.
+        Raise MissingReverseEdge if candidate generation fails to recover it.
         """
         steps = [
             (traj_index, step)
@@ -270,12 +245,9 @@ class BackwardPolicy:
     def allowed(
         self, edges: tuple[BackwardEdge, ...], reactions: int, synthons: int
     ) -> list[BackwardEdge]:
-        """The reverse steps of a state, not merely of its molecule.
+        """Keep edges that leave valid parent counters.
 
-        One rule for demonstrations and for walks alike: keep an edge when undoing it
-        leaves a legal predecessor at these counters (Eq. `parent_counts`). The test is
-        local -- an admissible parent may still be a dead end further back, which is what
-        gives REINFORCE something to learn.
+        This is a local check; a parent may still be a dead end.
         """
         return [
             edge
@@ -284,14 +256,10 @@ class BackwardPolicy:
         ]
 
     def rollout(self, start: list[tuple[str, int, int]]) -> Rollouts:
-        """Walk backward from each recorded terminal state `(molecule, reactions, synthons)`.
+        """Walk backward from recorded (smiles, reactions, synthons) states.
 
-        All walks advance together, one level per iteration, so each level costs a single
-        batched forward pass. A walk drops out when it has no candidates, or when `_Walk.take`
-        says it has finished. Log-probabilities keep their gradient; the choice itself does not.
-
-        `max_reactions + 1` is the longest route the forward MDP can produce, so it caps the
-        walk the way SynFlowNet's `algo.max_len` caps theirs.
+        Advance active walks in batches, for at most max_reactions + 1 steps.
+        Log-probabilities retain gradients; sampled choices do not.
         """
         env = self.env
         walks = [_Walk(smiles, n_r, n_s) for smiles, n_r, n_s in start]

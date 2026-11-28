@@ -39,9 +39,8 @@ class TrajectoryBalance:
     ) -> None:
         if loss_fn not in ("mse", "mae", "huber"):
             raise ValueError("loss_fn must be mse, mae, or huber")
-        # A learned P_B is evaluated here with the current parameters (detached inside TB)
-        # and trained by its own loss. Without one, P_B is the float stored by the sampler
-        # (RxnFlow's heuristic).
+        # Learned P_B is detached in TB and trained by its own loss; heuristic P_B comes
+        # from sampling.
         self.backward = backward
         self.policy = policy
         self.moo_scalarization = moo_scalarization
@@ -64,7 +63,6 @@ class TrajectoryBalance:
         model = self.policy.model
         device = self.policy.device
 
-        # 1. Compute rewards.
         beta = np.array([t.beta for t in trajectories], dtype=np.float64)
         preference = np.array([t.preference for t in trajectories], dtype=np.float64)
         objective_rewards = np.array(
@@ -74,23 +72,17 @@ class TrajectoryBalance:
             [t.property_reward for t in trajectories], dtype=np.float64
         ).clip(min=self.reward_floor)
 
-        # Scalarize the multi-objective rewards
         log_R = scalarize_log_rewards(
             objective_rewards, self.moo_scalarization, preference
         )
-        # Apply the property penalty to the scalarized reward
         log_R += np.log(property_rewards)
-        # Apply a floor
         log_R = np.clip(log_R, a_min=math.log(self.reward_floor), a_max=None)
-        # Scale the log rewards by beta
         scaled_log_R = beta * log_R
 
-        # Move to torch tensors
         beta = torch.from_numpy(beta.astype(np.float32)).to(device)
         preference = torch.from_numpy(preference.astype(np.float32)).to(device)
         scaled_log_R = torch.from_numpy(scaled_log_R.astype(np.float32)).to(device)
 
-        # 2. Encode each trajectory's stored condition and predict logZ.
         if cond is not None:
             assert cond.shape == (len(trajectories), model.condition_dim)
             cond = cond.to(device)
@@ -98,7 +90,6 @@ class TrajectoryBalance:
         log_Z = model.logZ(cond_emb).squeeze(-1)
         logit_scale = model.logit_scale(cond_emb).squeeze(-1)
 
-        # 3. Score all observed transitions together, then sum by trajectory.
         transitions = []
         traj_indices: list[int] = []
         bck_output = None
@@ -133,7 +124,6 @@ class TrajectoryBalance:
         else:
             traj_log_p_F = torch.zeros(len(trajectories), device=device)
 
-        # 4. Compute the trajectory-balance loss.
         tb_error = log_Z + traj_log_p_F - traj_log_p_B - scaled_log_R
         if self.loss_fn == "mse":
             tb_losses = tb_error.square()
@@ -150,7 +140,6 @@ class TrajectoryBalance:
             tb_loss = loss.detach()
             loss = loss + bck_output.aux_loss
 
-        # 5. Derive diagnostics from the same pre-update values without gradients.
         # "batch_entropy" is trajectory surprisal on this online+replay batch,
         # not categorical entropy or an unbiased on-policy entropy estimate.
         with torch.no_grad():

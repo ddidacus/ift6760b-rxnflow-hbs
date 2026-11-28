@@ -1,13 +1,8 @@
-"""benchmark helpers for P_B.
+"""Backward-policy benchmarks.
 
-A backward walk "solves" a product when it reaches the empty state *and its route replays*:
-applying the edges forward through `SynthesisEnv.step`, starting from the empty state, must
-be accepted by the environment (action available for the state's counters, reaction succeeds)
-and end in the same terminal molecule. That is stricter than checking reaction/synthon counts.
-
-For any policy that gives a probability to every candidate of a state, the distribution over
-complete routes can be enumerated exactly (candidate graphs are tiny), so solve rates need no
-sampling noise: solve@k of a product is 1 - (1 - p)^k with p the replay-verified probability.
+A route solves a product only if it reaches the empty state and replays
+through SynthesisEnv.step to the same terminal molecule. For the enumerated
+routes, solve@k = 1 - (1 - p)**k, where p is the replay-verified solve probability.
 """
 
 from __future__ import annotations
@@ -28,16 +23,15 @@ from IFT6760.objectives.backward import reinforce_loss
 from IFT6760.policies.backward import BackwardPolicy, Decisions
 from IFT6760.training.config import BackwardConfig
 
-Key = tuple[str, int, int]  # note: (state SMILES, reactions used, synthons used)
+Key = tuple[str, int, int]  # (state SMILES, reactions, synthons)
 
 
 def replay(
     env: SynthesisEnv, route: tuple[BackwardEdge, ...], product: str
 ) -> tuple[bool, str]:
-    """apply `route` (product first, FirstSynthon last) forward from the empty state.
+    """Replay a reverse-ordered route from the empty state.
 
-    Returns (ok, reason). ok means every action was accepted by the environment and the
-    walk ends in the terminal molecule `product`.
+    Return (ok, reason); success requires the same terminal product.
     """
     state = env.initial_state()
     for action, _ in reversed(route):
@@ -67,7 +61,7 @@ def trajectory_key(trajectory) -> Key:
 
 
 def row_key(row: dict) -> Key:
-    """The same, from a `sample.jsonl` row."""
+    """Return (final molecule, reactions, synthons) from a sample.jsonl row."""
     return (
         row["final_smiles"],
         *counts_of(ActionType[step["action_type"]] for step in row["traj"]),
@@ -84,12 +78,10 @@ Tree = dict[Key, tuple[tuple[BackwardEdge, ...], list[tuple]]]
 
 
 def build_tree(env: SynthesisEnv, analyzer, starts: list[Key]) -> Tree:
-    """One-step candidate graph from each start, on the same rule the sampler uses.
+    """Build reverse candidate graphs using the sampler's parent_counts filter.
 
-    A key is `(smiles, reactions, synthons)` with the counters *still to be undone*, so
-    an edge appears only when `SynthesisEnv.parent_counts` admits it -- exactly what
-    `BackwardPolicy.allowed` applies. Reaching the empty state with both counters at zero
-    is a complete route; there is no separate legality test and no dead branch to carry.
+    Keys are (smiles, reactions, synthons), with counters still to undo.
+    A complete route reaches the empty state with both counters at zero.
     """
     tree: Tree = {}
     level = set(starts)
@@ -131,7 +123,7 @@ class Route:
 def enumerate_routes(
     env: SynthesisEnv, tree: Tree, start: Key, cache: dict
 ) -> list[Route]:
-    """Every complete backward route from `start` (those that reach the empty state)."""
+    """Enumerate complete backward routes from start."""
     found: list[Route] = []
     product = start[0]
 
@@ -255,7 +247,6 @@ def sample_uniform_routes(
 
 
 def solved_by_replay(env: SynthesisEnv, starts: list[str], routes) -> list[bool]:
-    """A walk is solved if it reached the empty state and its route replays."""
     return [
         bool(route) and route[-1][1] == "" and replay(env, tuple(route), start)[0]
         for start, route in zip(starts, routes, strict=True)
@@ -314,7 +305,7 @@ def observed_decisions(env: SynthesisEnv, rows: list[dict]):
     for (_, step), options in zip(steps, candidates, strict=True):
         keys = [edge_key(env, e) for e in options]
         if observed_key(step) not in keys:
-            continue  # not regenerated (never happens on the reference run)
+            continue  # Candidate generation missed the observed edge.
         smiles.append(step["product_smiles"])
         edges.append(options)
         index.append(keys.index(observed_key(step)))
@@ -335,7 +326,6 @@ def train_head(
     seed: int = 0,
     train_encoders: bool = False,
 ) -> float:
-    """Train P_B alone on fixed molecules."""
     model = policy.model
     params = (
         list(model.parameters())

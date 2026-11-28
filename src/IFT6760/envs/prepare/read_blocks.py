@@ -99,7 +99,6 @@ def read_blocks(
     records = _read_building_blocks(source_path)
     records = _clean_building_blocks(records)
 
-    # Screen cleaned source molecules before converting them to synthons.
     if druglikeness_threshold is not None:
         from druglikeness.deepdl import DeepDL
 

@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 
 def init_logger(log_path: Path) -> None:
-    """Configure the logger to write to both console and file."""
     logger.setLevel(logging.INFO)
     logger.propagate = False
     for handler in logger.handlers[:]:
@@ -45,11 +44,9 @@ def init_logger(log_path: Path) -> None:
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
-    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-    # File handler
     file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
@@ -67,14 +64,12 @@ class RxnFlowTrainer:
         num_workers: int = 4,
         conditioning: ConditioningModule | None = None,
     ):
-        # Validate the configuration
         config.validate()
         if num_workers < 0:
             raise ValueError("num_workers must be non-negative")
         self.config: Config = config
         self.num_workers = num_workers
 
-        # Set up the output directory
         self.output_dir = Path(output_dir)
         if self.output_dir.exists():
             raise FileExistsError(f"output directory already exists: {self.output_dir}")
@@ -108,7 +103,6 @@ class RxnFlowTrainer:
         )
         logger.info("Output directory: %s", self.output_dir)
 
-        # Reward function and objectives
         self.conditioning = conditioning
         self.reward: RewardFunction = reward
         self.objectives: tuple[str, ...] = tuple(reward.objectives)
@@ -128,7 +122,6 @@ class RxnFlowTrainer:
 
     def _setup_env(self) -> None:
         cfg = self.config
-        # Initialize the environment
         logger.info("Loading environment: %s", cfg.env_dir)
         self.env = SynthesisEnv(
             cfg.env_dir,
@@ -148,7 +141,6 @@ class RxnFlowTrainer:
         )
 
     def _setup_model(self) -> None:
-        """Initialize the model and policy for online training"""
         cfg = self.config
         condition_dim = (
             self.conditioning.encoding_dim if self.conditioning is not None else None
@@ -174,7 +166,6 @@ class RxnFlowTrainer:
         )
 
     def _setup_optimizer(self) -> None:
-        """Initialize the optimizer and learning rate scheduler"""
         cfg = self.config
         self.policy_parameters = [
             parameter
@@ -191,9 +182,9 @@ class RxnFlowTrainer:
         ]
         head = self.model.backward_head
         if head is not None and cfg.backward.learning_rate is not None:
-            # The backward head gets its own learning rate (gradient clipping still
-            # covers it through policy_parameters). Appended last so group 0 stays the
-            # policy group that the learning-rate log reports.
+            # Append the backward head last; group 0 remains the logged policy learning
+            # rate.
+            # policy_parameters still includes it for gradient clipping.
             head_ids = {id(p) for p in head.parameters()}
             groups[0] = {
                 "params": [p for p in self.policy_parameters if id(p) not in head_ids]
@@ -211,7 +202,6 @@ class RxnFlowTrainer:
         )
 
     def _setup_replay(self) -> None:
-        """Initialize the replay buffer."""
         cfg = self.config
         self.replay = ReplayBuffer(
             cfg.training.replay_capacity,
@@ -220,7 +210,6 @@ class RxnFlowTrainer:
         )
 
     def _setup_training(self) -> None:
-        """Initialize the gfn training components"""
         cfg = self.config
 
         backward_objective = None
@@ -293,16 +282,14 @@ class RxnFlowTrainer:
         temporary.replace(destination)
         latest = self.checkpoint_dir / "latest.ckpt"
         latest_temporary = latest.with_suffix(".tmp")
-        # Copy serialized bytes; do not deserialize the replay and optimizer
-        # just to serialize the identical checkpoint again.
+        # Copy checkpoint bytes without deserializing optimizer or replay state.
         shutil.copyfile(destination, latest_temporary)
         latest_temporary.replace(latest)
         logger.info("Checkpoint saved: %s (%.1fs)", destination, perf_counter() - started)
         return destination
 
     def load_checkpoint(self, path: str | Path) -> None:
-        # RNG states are CPU byte tensors even for a CUDA model. Parameter and
-        # optimizer loaders move their own tensors to the model device.
+        # RNG state stays on CPU; model and optimizer loaders move their own tensors.
         logger.info("Loading checkpoint: %s", path)
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         check_model_compatibility(checkpoint["rxnflow_version"])
@@ -312,8 +299,8 @@ class RxnFlowTrainer:
             raise ValueError(
                 "restart configuration differs from the resolved checkpoint configuration"
             )
-        # Resume restores catalog-indexed actions in replay; sampling can replace
-        # the catalog, but resume requires identical content and synthesis rules.
+        # Replay stores catalog row indices, so resume needs identical catalog content and
+        # rules.
         if (
             saved_environment["content_sha256"] != self.env.signature["content_sha256"]
             or saved_environment["synthesis"] != self.env.signature["synthesis"]
@@ -363,8 +350,8 @@ class RxnFlowTrainer:
             self.env.max_atoms,
             self.config.reward.property_penalty_ratio,
         )
-        # Property penalties multiply the scalarized reward, independently of
-        # MOO preference. Floor inputs here; TB also floors the final reward.
+        # Property penalties apply after scalarization, independently of preference.
+        # Floor inputs here; TB also floors the final reward.
         reward_floor = self.config.training.reward_floor
         preference = np.array([t.preference for t in trajectories], dtype=np.float64)
         log_rewards = scalarize_log_rewards(
@@ -454,7 +441,6 @@ class RxnFlowTrainer:
             checkpoint = None
             logger.info("Starting training; full log at %s", log_path)
             while self.step < final_step:
-                # 1. Generate online trajectories with the EMA model and score rewards.
                 started = perf_counter()
                 self.sampling_model.eval()
                 count = self.config.training.num_online
@@ -477,14 +463,12 @@ class RxnFlowTrainer:
                 )
                 sample_time = perf_counter() - started
                 self._assign_rewards(online_trajs)
-                # 2. Sample replay before insertion so online trajectories cannot be
-                # duplicated as replay entries in this same optimization batch.
+                # Sample replay before insertion to avoid duplicating this online batch.
                 replay_trajs = self.replay.sample(
                     self.config.training.num_replay, self.rng
                 )
                 batch = online_trajs + replay_trajs
                 self.replay.add(online_trajs, self.rng)
-                # 3. Update the policy/logZ, learning rates, and EMA sampling weights.
                 self.model.train()
                 self.optimizer.zero_grad(set_to_none=True)
                 # Replay retains its original conditions; never sample new labels here.
@@ -500,8 +484,7 @@ class RxnFlowTrainer:
                     num_replay=len(replay_trajs),
                 )
                 loss.backward()
-                # clip_grad_norm_ already returns the pre-clip norm. No second
-                # traversal of policy gradients is needed for diagnostics.
+                # clip_grad_norm_ already returns the pre-clip norm.
                 policy_grad_norm = self._clip_policy_gradients()
                 loss_info.update(
                     policy_grad_norm=policy_grad_norm,
@@ -520,9 +503,8 @@ class RxnFlowTrainer:
                 self._update_ema()
                 self.step += 1
 
-                # 4. Collect scalar diagnostics, persist online attempts, and checkpoint.
-                # Transfer scalar diagnostics together rather than synchronizing
-                # CUDA separately for every metric. TB values are pre-update.
+                # Transfer diagnostics together to avoid one CUDA sync per metric; TB
+                # values are pre-update.
                 loss_metrics = dict(
                     zip(
                         loss_info,
@@ -562,7 +544,6 @@ class RxnFlowTrainer:
                     "time": perf_counter() - started,
                 }
 
-                # Log the generated trajectories and training metrics.
                 self._write_samples(online_trajs)
                 with log_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, sort_keys=True) + "\n")

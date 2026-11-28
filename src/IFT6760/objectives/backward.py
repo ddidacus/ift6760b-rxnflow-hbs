@@ -1,15 +1,9 @@
-"""MLE and REINFORCE for the learned P_B, following SynFlowNet.
+"""MLE and REINFORCE losses for P_B, following SynFlowNet Algorithms 1 and 2.
 
-TB consumes `traj_log_p_B` detached, so these losses are P_B's only gradient. The two are
-independent objectives, never combined, and they differ in which trajectories they cover
-(SynFlowNet Algorithms 1 and 2):
-
-* MLE minimises `L_B` over the forward trajectories `{tau_F}` alone.
-* REINFORCE minimises `J_B` over `{tau_B} union {tau_F}`: backward walks sampled from the
-  current P_B, together with the batch's forward trajectories. A walk starts from a recorded
-  terminal state (molecule *and* counters) drawn from the replay buffer and decrements them,
-  so `R_B` is +1 exactly when it reaches the empty state and `illegal_reward` otherwise,
-  plus an entropy bonus and no baseline.
+TB uses detached backward log-probabilities. MLE trains on forward trajectories;
+REINFORCE uses forward trajectories plus backward walks from replay states.
+Walks receive +1 for reaching the empty state with counters exhausted, or
+illegal_reward otherwise. REINFORCE adds an entropy bonus and uses no baseline.
 """
 
 from __future__ import annotations
@@ -43,11 +37,7 @@ def rollout_rewards(cfg: BackwardConfig, rollouts: Rollouts) -> torch.Tensor:
 
 @dataclass
 class ForwardTrajectories:
-    """The `{tau_F}` half of REINFORCE's union: the batch's forward trajectories.
-
-    They reach s_0 by construction, so `R_B` is +1 for all of them and only their
-    log-probability and entropy are needed here.
-    """
+    """Forward trajectories included in REINFORCE, each with reward +1."""
 
     log_prob: torch.Tensor  # [N] sum of log P_B over each trajectory's observed edges
     entropy: torch.Tensor  # [M] entropy of P_B at each observed decision
@@ -58,10 +48,9 @@ def reinforce_loss(
     rollouts: Rollouts,
     forward: ForwardTrajectories | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """`J_B = -mean(R_B * log P_B(tau))` over `{tau_B} union {tau_F}`, minus the entropy bonus.
+    """Return -mean(reward * log P_B(route)) minus the entropy bonus.
 
-    `forward` is the `{tau_F}` half and is omitted only when evaluating P_B on its own,
-    where no forward trajectories exist.
+    Include forward trajectories when supplied; standalone evaluation omits them.
     """
     rewards = rollout_rewards(cfg, rollouts)
     log_prob, entropies = rollouts.log_prob, [rollouts.entropy]
@@ -82,11 +71,9 @@ def reinforce_loss(
 
 
 class BackwardObjective:
-    """Evaluates the learned P_B on a batch of trajectories and returns its training loss.
+    """Score trajectories under P_B and compute its training loss.
 
-    `replay` and `rng` supply REINFORCE's `{tau_B}` start states, drawn from the replay
-    buffer. One is drawn per trajectory
-    in the batch, so the two halves of the union are equal.
+    REINFORCE draws one start state per batch trajectory from replay.
     """
 
     def __init__(
@@ -100,11 +87,7 @@ class BackwardObjective:
         self.replay, self.rng = replay, rng
 
     def _start_states(self, count: int) -> list[tuple[str, int, int]]:
-        """Valid terminal states from the replay buffer: molecule and recorded counters.
-
-        A walk needs the counters, not just the molecule: it decrements them, so reaching
-        the empty state means the route it found spends exactly what the recorded one did.
-        """
+        """Sample valid replay terminals with their recorded reaction/synthon counts."""
         if self.replay is None or self.rng is None:
             return []
         starts = []
@@ -134,8 +117,7 @@ class BackwardObjective:
 
         counts = torch.tensor([len(e) for e in decisions.edges], device=device).float()
         if cfg.objective == "none":
-            # Frozen control: uniform over the candidates, so log P_B = -log|C| and
-            # the entropy is log|C|. Constant, hence no gradient and nothing to train.
+            # Frozen uniform control: log P_B = -log|C|, entropy = log|C|.
             logp_observed, entropy, accuracy = -counts.log(), counts.log(), zero
         else:
             logp, seg = policy.log_probs(decisions)
@@ -164,8 +146,7 @@ class BackwardObjective:
             terms.append(cfg.mle_weight * mle)
             info["bck_mle_loss"] = mle.detach()
         if cfg.uses_reinforce:
-            # J_B covers {tau_B} union {tau_F}, as in SynFlowNet's Algorithm 2. With no
-            # replay buffer there are no start states and this term is skipped.
+            # Include backward walks from replay, as in SynFlowNet Algorithm 2.
             start = self._start_states(num_trajectories)
             if start:
                 loss, rollout_info = reinforce_loss(

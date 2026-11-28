@@ -11,10 +11,10 @@ from .nn import mlp
 
 
 class BackwardHead(nn.Module):
-    """logit(e | s') = MLP([h(s'), rxn(e), type(e), synthon(e)]).
+    """Score edges with MLP([h(state), reaction, action type, synthon]).
 
-    The embeddings come from the forward policy, so P_B shares its trunk, as in
-    SynFlowNet. A softmax over one state's candidates happens outside this module.
+    Embeddings are shared with the forward policy, as in SynFlowNet.
+    The caller applies softmax over each state's candidates.
     """
 
     def __init__(
@@ -47,6 +47,6 @@ class BackwardHead(nn.Module):
         return self.mlp(torch.cat(parts, dim=-1)).squeeze(-1)
 
     def zero_output(self) -> None:
-        """Start from equal logits, i.e. a P_B that is uniform over the candidates."""
+        """Initialize equal logits for a uniform backward policy."""
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)

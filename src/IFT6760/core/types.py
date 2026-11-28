@@ -17,17 +17,14 @@ from .molecule import Molecule
 # Action name and optional synthon library; unimolecular actions use None.
 ActionKey: TypeAlias = tuple[str, str | None]
 
-# A list of ActionSubspace objects, one per reaction and library pair.
 ActionSpace = list["ActionSubspace"]
 
-# Reverse-ordered edges: (forward action, parent SMILES), ending at the empty
-# state's SMILES "" through FirstSynthon. The number of entries is the route length.
+# Reverse-ordered (action, parent SMILES) edges, ending at "" via FirstSynthon.
 BackwardTrajectory = list[tuple["Action", str]]
 
 # One reverse step: (forward action, parent SMILES); the empty state's SMILES is "".
 BackwardEdge = tuple["Action", str]
 
-# Named external conditions, e.g. pocket keys or target property values.
 Condition: TypeAlias = dict[str, Any]
 
 InvalidReason = Literal["invalid_transition", "max_reactions"]
@@ -54,11 +51,9 @@ class ActionType(IntEnum):
 
     @property
     def cost(self) -> tuple[int, int]:
-        """(reactions, synthons) this action type consumes.
+        """Return the (reactions, synthons) consumed by this action.
 
-        The MDP's counting rule, stated once: FirstSynthon spends a synthon but no
-        reaction, a unimolecular reaction spends a reaction but no synthon, and a
-        bimolecular reaction spends one of each.
+        FirstSynthon costs (0, 1), unimolecular reactions (1, 0), and couplings (1, 1).
         """
         return (0 if self.is_first else 1, 0 if self.is_unirxn else 1)
 
@@ -71,7 +66,6 @@ class State:
     num_reactions: int = 0
     terminated: bool = False
     num_synthons: int = 0
-    # graph features
     _cache: dict[str, Any] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -153,11 +147,11 @@ class Action:
 
 @dataclass
 class ActionSubspace:
-    """One (reaction, library) pair, independent of policy logits.
+    """One (reaction, library) pair.
 
-    A unimolecular reaction uses library=None and has one action. num_actions is the
-    full library size; sample_indices=None selects that full range. A sampled
-    subspace holds one array mapping columns back to original synthon indices.
+    Unimolecular actions have library=None and num_actions=1. For synthon
+    libraries, num_actions is the full size and sample_indices maps sampled
+    columns to catalog rows; None uses all rows.
     """
 
     name: ActionKey

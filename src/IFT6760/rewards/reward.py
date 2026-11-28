@@ -12,9 +12,7 @@ from numpy.typing import NDArray
 
 
 class RewardFunction(ABC):
-    """Abstract base class for reward functions.
-    Define ``objectives`` and implement ``score()`` to define a reward function.
-    """
+    """Define objectives and implement score() for a reward function."""
 
     objectives: tuple[str, ...]
 
@@ -35,12 +33,10 @@ class RewardFunction(ABC):
 
     @property
     def num_objectives(self) -> int:
-        """Number of objectives."""
         return len(self.objectives)
 
     @cached_property
     def _cache(self) -> dict[str, NDArray[np.float32]]:
-        """Cache scores by SMILES for calls without conditions."""
         return {}
 
     def __call__(
@@ -48,7 +44,6 @@ class RewardFunction(ABC):
         smiles_list: list[str | None],
         cond_list: list[dict[str, Any]] | None = None,
     ) -> NDArray[np.float32]:
-        """Evaluate molecules through ``run``."""
         return self.run(smiles_list, cond_list)
 
     def run(
@@ -56,14 +51,11 @@ class RewardFunction(ABC):
         smiles_list: list[str | None],
         cond_list: list[dict[str, Any]] | None = None,
     ) -> NDArray[np.float32]:
-        """Score a batch of molecules."""
         num_samples = len(smiles_list)
 
-        # Initialize the result array with zeros
         result = np.zeros((num_samples, self.num_objectives), dtype=np.float32)
 
         if cond_list is not None:
-            # If conditions are provided, skip caching or deduplication
             assert len(cond_list) == len(
                 smiles_list
             ), "Length of cond_list must match length of smiles_list"
@@ -82,20 +74,16 @@ class RewardFunction(ABC):
             result[indices] = scores
             return result
 
-        # Create an index before removing None and duplicates
         mapping: dict[str, list[int]] = {}
         for index, smi in enumerate(smiles_list):
             if smi is None:
                 continue
             mapping.setdefault(smi, []).append(index)
 
-        # Remove duplicates and cached molecules
         pending = [smi for smi in mapping if smi not in self._cache]
 
-        # Score uncached molecules
         if len(pending) > 0:
             scores = self.score(pending).astype(np.float32)
-            # Validate scores
             if scores.shape != (len(pending), len(self.objectives)):
                 raise ValueError(
                     "RewardFunction.score must return [batch, num_objectives]"
@@ -106,7 +94,6 @@ class RewardFunction(ABC):
             for smi, values in zip(pending, scores, strict=True):
                 self._cache[smi] = values.copy()
 
-        # Fill in the results for all molecules
         for smi, indices in mapping.items():
             result[indices] = self._cache[smi]
 
