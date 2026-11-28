@@ -10,22 +10,39 @@ Upstream: <https://github.com/SeonghwanSeo/RxnFlow>
 | Version | `rxnflow 2.1.1` |
 
 The `.git` directory was removed so this does not become a repository nested inside the
-parent. **Nothing in the upstream tree was modified**: `README.md`, `LICENSE`, `pyproject.toml`
-and every file under `src/`, `configs/`, `examples/`, `scripts/` and `data/` are as cloned.
-Everything added for this package lives in `hbs/`, and reaches RxnFlow by subclassing it:
+parent. **No upstream file was modified**: every file the clone shipped is as cloned, and
+the two full-space arms are added as a new subpackage, `src/rxnflow/gflownet/fwd/`, that
+reaches RxnFlow by subclassing `RxnFlowPolicy` and `RxnFlowTrainer`. Everything specific
+to these experiments -- rewards, entry point, configs, analysis -- stays in `hbs/`:
 
 ```
-hbs/reservoir.py            hierarchical binary search over fixed features, hashed once
-hbs/policy.py               RxnFlowPolicy with no subsampling: candidates are a bucket
-hbs/metrics.py              per-trajectory diversity and latency, identical in both arms
-hbs/trainer.py              the two trainers: metrics-only, and metrics + HBS
+src/rxnflow/gflownet/fwd/
+  base.py                   step clock and metric hooks, shared by both arms
+  sampling.py               per-row importance weights for an uneven candidate set
+  metrics.py                per-trajectory diversity and latency, identical in all arms
+  calibration.py            reward-proportionality of a step's online sample
+  trainer.py                upstream training plus the metrics both arms report
+  hbs/reservoir.py          hierarchical binary search over fixed features, hashed once
+  hbs/policy.py             RxnFlowPolicy with no subsampling: candidates are a bucket
+  hbs/trainer.py            builds the reservoir and the query projection
+  cas/index.py              spherical k-means over the catalog, cells and assignments
+  cas/policy.py             P(action) = P(cell) * P(row|cell), cell choice in the loss
+  cas/trainer.py            builds one index per library (CAS-Validity)
+  cas/fullspace.py          one index over the whole catalog (CAS-FullSpace)
+
 hbs/reward.py               roshambo2 shape/colour reward, CDK8 by default
-hbs/train.py                entry point for both arms
-hbs/analyze.py              quality and diversity of a finished run
+hbs/pmo.py                  PMO benchmark oracles (23 tasks) as a reward, via PyTDC
+hbs/train.py                entry point for both arms and both rewards
+hbs/analyze.py              quality and diversity of a finished run, incl. AUC top-10
 hbs/monitor.py              side-by-side status of running runs
-hbs/configs/cdk8.yaml       the run configuration, shared by both arms
+hbs/configs/cdk8.yaml       the CDK8 run configuration, shared by both arms
 hbs/configs/cdk8_enamine.yaml  the same, over the prepared 290k Enamine catalog
-hbs/sbatch/train_cdk8.sh    one run on one GPU
+hbs/configs/pmo_*.yaml      the four PMO tasks set up here (gsk3b, jnk3, drd2, amlodipine)
+hbs/configs/README-pmo.md   the PMO protocol, metric and caveats
+hbs/sbatch/train_cdk8.sh    one CDK8 run on one GPU
+hbs/sbatch/train_pmo.sh     one PMO run on one GPU; also the 8-run array
+hbs/sbatch/sweep_pmo.sh     4 PMO seeds in parallel on one 4-GPU node
+examples/pmo.py             minimal PMO run on upstream's trainer, no HBS, no metrics
 hbs/requirements-frozen.txt the installed environment
 ```
 
@@ -40,13 +57,29 @@ uv venv --python 3.12          # roshambo2 requires >=3.11, rxnflow >=3.10
 uv pip install -e .
 uv pip install roshambo2==1.0.0
 uv pip install pandas          # roshambo2 imports it without declaring it
+
+# PMO oracles. --no-deps is not optional: PyTDC's declared dependencies pull in
+# scanpy, tiledb, transformers and a dozen more, and would downgrade rdkit from
+# 2025.9.1 to 2023.9.6, which the roshambo2 runs are pinned to. Only the handful
+# below is actually reached by the chemistry oracles.
+uv pip install --no-deps "PyTDC==1.1.14"
+uv pip install "scikit-learn==1.7.2" fuzzywuzzy python-Levenshtein requests tqdm \
+    setuptools seaborn huggingface_hub
 ```
 
-`roshambo2` is not an extra of upstream's `pyproject.toml` and was not added to it, so the
-core install stays exactly as cloned; the frozen set is in `hbs/requirements-frozen.txt`
+**scikit-learn must stay at 1.7.x.** TDC's `gsk3b`, `jnk3` and `drd2` are pickles written
+by sklearn 0.22. `hbs/pmo.py` migrates them forward while loading, but 1.8 removed the
+back-compatible unpickling paths that even that relies on. The failure is quiet in the worst
+way -- TDC's single-SMILES path catches the exception and returns 0.0, so a run would train
+against an all-zero reward -- so `hbs/pmo.py` checks the version and refuses to start, and
+verifies each model-backed oracle against three probe molecules with known scores.
+
+Neither `roshambo2` nor `PyTDC` is an extra of upstream's `pyproject.toml`, and neither was
+added to it, so the core install stays exactly as cloned; the frozen set is in
+`hbs/requirements-frozen.txt`
 (`torch 2.9.0+cu128`, `numpy 2.4.4`, `rdkit 2025.9.1`, `roshambo2 1.0.0`). There is no
-`uv.lock` here for the same reason: the environment is `pyproject.toml` plus those three
-commands.
+`uv.lock` here for the same reason: the environment is `pyproject.toml` plus the commands
+above.
 
 ## Prepared synthesis environment
 
@@ -109,6 +142,42 @@ libraries, holding 5,343 of the 5,864 synthons**, so 1,652 of 5,864 candidate ac
 scored per state and the mechanism being replaced is actually doing something. Each run
 writes `training.log`, `training.jsonl` (per-step metrics), `sample.jsonl` (every molecule,
 its reward and its synthesis route), `checkpoints/` and a final `run_summary.json`.
+
+## The PMO runs
+
+The second objective family, added so the two arms can be compared on more than one target
+and against published baselines. [`hbs/configs/README-pmo.md`](hbs/configs/README-pmo.md) is
+the protocol and the caveats; the short version:
+
+```bash
+# 4 seeds x 2 arms on jnk3, one GPU each, all at once
+TASK=jnk3 HBS_NOISE_SIGMA=0.8 sbatch --array=0-7 hbs/sbatch/train_pmo.sh
+```
+
+`hbs/pmo.py` exposes all 23 tasks of the Practical Molecular Optimization benchmark (Gao et
+al., NeurIPS 2022) through `PyTDC`; four have configs — `gsk3b`, `jnk3`, `drd2` (three sparse
+activity classifiers) and `amlodipine_mpo` (one dense multi-property objective). Everything
+else in the config matches `cdk8_enamine.yaml`, so a PMO pair and a CDK8 pair differ in the
+objective and nothing else.
+
+Three things differ from the CDK8 runs, all of them consequences of the reward being cheap:
+
+- **The budget ends the run, not the step count.** `max_oracle_calls` in the config (50,000;
+  PMO publishes 10,000) raises `OracleBudgetExhausted`, which `hbs/train.py` records as a
+  completed run. Both arms therefore stop at the same number of scored molecules, which is
+  the comparison PMO is built around.
+- **The reward is no longer the wall time.** Measured on one L40S over the Enamine catalog
+  with `jnk3`: a step is 1.6s uniform and 4.5s HBS, of which the reward is 0.37s per
+  64-molecule batch — against ~40s a step for roshambo2 on the same catalog. So unlike the
+  CDK8 runs, **these runs can be compared on wall time**, and the 2.8x between the arms is
+  the mechanism rather than noise around a dominant reward.
+- **Much smaller jobs**: 6 CPUs and 24G rather than 16 and 32G, because there is no conformer
+  pool to feed. `oracle/` holds the three model-backed oracles' checkpoints (~74MB), and
+  `TDC_ORACLE_DIR` points the reward at them so a compute node never re-downloads them.
+
+The metric is **AUC top-10** — the area under the (oracle calls, mean reward of the 10 best
+distinct molecules) curve, divided by the budget. `hbs/analyze.py` already computed it for
+the CDK8 runs and needs no changes.
 
 ## What the HBS arm changes
 
@@ -241,8 +310,13 @@ and score finished ones (top-k reward, `div@k`, scaffolds, `#circles`, `auc_top_
 
 `RxnFlowTrainer.__init__` refuses an existing output directory and `load_checkpoint` refuses
 a changed config, reward class or catalog. A restart therefore needs a *new* `OUTPUT_DIR=`
-plus `--resume-from-checkpoint <old>/checkpoints/latest.ckpt`. `long` is not preempted, so
-this only comes up after a crash or a node failure.
+plus `--resume-from-checkpoint <old>/checkpoints/latest.ckpt`. `long` *is* preemptible —
+one job of the CDK8 seed sweep was preempted at 53 minutes — so this comes up for any run
+there, not only after a crash. `checkpoint_every` caps what a preemption costs: 200 steps in
+`cdk8_enamine_seeds.yaml` and in the PMO configs. `short-unkillable`
+([`hbs/sbatch/sweep_pmo.sh`](hbs/sbatch/sweep_pmo.sh)) is not preempted, but its QoS sets
+`MinTRES gres/gpu=4` and a 3h limit, so a job there has to take a whole 4-GPU node and
+finish inside three hours.
 
 ## Scope
 

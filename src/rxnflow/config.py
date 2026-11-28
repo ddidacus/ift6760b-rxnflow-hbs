@@ -197,6 +197,60 @@ class TrainingConfig:
 
 
 @dataclass
+class BackwardConfig:
+    """P_B types:
+
+    heuristic - RXNFlow's default (recursive backward search).
+    learned scores the one-step reverse candidates of each state using nn
+        objective` picks how that head is trained (`none` keeps P_B uniform over the candidates).
+    """
+
+    mode: Literal["heuristic", "learned"] = "heuristic"
+    objective: Literal["none", "mle", "reinforce"] = "mle"
+    mle_weight: float = 1.0
+    reinforce_weight: float = 1.0
+    entropy_weight: float = 1.0
+    # A rollout scores +1 when its route is a forward trajectory and this value otherwise.
+    illegal_reward: float = -1.0
+    # stop the P_B loss from updating the encoders shared with the forward policy.
+    detach_shared: bool = False
+    # lr of the backward head;
+    learning_rate: float | None = None
+    # Number of one-step candidate lists kept in the LRU cache.
+    cache_size: int = 200_000
+
+    @property
+    def learned(self) -> bool:
+        return self.mode == "learned"
+
+    @property
+    def uses_mle(self) -> bool:
+        return self.learned and self.objective == "mle"
+
+    @property
+    def uses_reinforce(self) -> bool:
+        return self.learned and self.objective == "reinforce"
+
+    def validate(self) -> None:
+        if self.mode not in ("heuristic", "learned"):
+            raise ValueError("backward.mode must be heuristic or learned")
+        if self.objective not in ("none", "mle", "reinforce"):
+            raise ValueError("backward.objective must be none, mle or reinforce")
+        for name in ("mle_weight", "reinforce_weight", "entropy_weight"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"backward.{name} must be finite and non-negative")
+        if not math.isfinite(self.illegal_reward):
+            raise ValueError("backward.illegal_reward must be finite")
+        if self.learning_rate is not None and not (
+            math.isfinite(self.learning_rate) and self.learning_rate > 0
+        ):
+            raise ValueError("backward.learning_rate must be finite and positive")
+        if self.cache_size <= 0:
+            raise ValueError("backward.cache_size must be positive")
+
+
+@dataclass
 class Config:
     """Top-level runtime configuration.
 
@@ -212,6 +266,7 @@ class Config:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    backward: BackwardConfig = field(default_factory=BackwardConfig)
 
     def validate(self) -> None:
         self.reward.validate()
@@ -230,6 +285,7 @@ class Config:
         self.generation.validate()
         self.model.validate()
         self.training.validate()
+        self.backward.validate()
         if not self.env_dir:
             raise ValueError("env_dir must point to a prepared synthon environment")
 

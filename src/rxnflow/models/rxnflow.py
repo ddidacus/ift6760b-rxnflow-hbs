@@ -6,18 +6,23 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from rxnflow.config import ModelConfig
 from rxnflow.core.types import ActionType
 from rxnflow.envs.env import SynthesisEnv
 from rxnflow.envs.graph import EDGE_DIM, GRAPH_DIM, NODE_DIM, GraphBatch
+from rxnflow.config import BackwardConfig, ModelConfig
 
+from .backward import BackwardHead
 from .encoders import ExternalConditionEncoder, GFNConditionEncoder, SynthonEncoder
 from .mpnn import MPNN
 from .nn import mlp
 
 
 class RxnFlowModel(nn.Module):
-    """RxnFlow model"""
+    """RxnFlow model
+
+    With a learned backward policy (`backward.mode == "learned"`) the model also owns a
+    `BackwardHead`; otherwise it is exactly the RxnFlow v2.1.1 model.
+    """
 
     def __init__(
         self,
@@ -25,6 +30,7 @@ class RxnFlowModel(nn.Module):
         cfg: ModelConfig,
         num_objectives: int = 1,
         condition_dim: int | None = None,
+        backward: BackwardConfig | None = None,
     ):
         super().__init__()
         self.num_objectives: int = num_objectives
@@ -88,6 +94,18 @@ class RxnFlowModel(nn.Module):
         # Trajectory-balance (TB)
         self._logZ = mlp(cond_dim, hidden_dim, d_out=1, n_layer=2)
 
+        # Backward head (learned P_B only). Created last, so the initialisation of every
+        # other module is identical to the baseline model.
+        self.backward_head: BackwardHead | None = None
+        if backward is not None and backward.learned:
+            self.backward_head = BackwardHead(
+                cfg.state_dim,
+                rxn_dim,
+                synthon_dim,
+                hidden_dim,
+                cfg.num_action_layers,
+            )
+
         self.init_weight()
 
     def init_weight(self) -> None:
@@ -110,6 +128,8 @@ class RxnFlowModel(nn.Module):
         nn.init.zeros_(self._logit_scale[-1].bias)
         nn.init.zeros_(self._logZ[-1].weight)
         nn.init.zeros_(self._logZ[-1].bias)
+        if self.backward_head is not None:
+            self.backward_head.zero_output()
 
     def logit_scale(self, cond: torch.Tensor) -> torch.Tensor:
         r"""[B, 2*hidden_dim] → [B] \in [0, ∞)."""

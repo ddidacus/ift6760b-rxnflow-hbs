@@ -1,8 +1,10 @@
 # RxnFlow-HBS
 
-A fork of upstream RxnFlow for the IFT6760B project. Nothing under `src/` is modified:
-everything added lives in `hbs/` and reaches RxnFlow by subclassing `RxnFlowPolicy` and
-`RxnFlowTrainer`, so the baseline arm runs upstream code exactly as cloned.
+A fork of upstream RxnFlow for the IFT6760B project. No upstream file is modified: the
+action policies are added as a new subpackage, `src/rxnflow/gflownet/fwd/`, that reaches
+RxnFlow by subclassing `RxnFlowPolicy` and `RxnFlowTrainer`, so the baseline arm runs
+upstream code exactly as cloned. The experiment harness around them -- rewards, entry
+point, configs, analysis -- lives in `hbs/`.
 
 What is implemented so far is **HBS** — hierarchical binary search over the
 building-block space, in place of upstream's uniform action subsampling:
@@ -17,6 +19,13 @@ building-block space, in place of upstream's uniform action subsampling:
   one `Linear(synthon_dim -> feature_dim)` projecting their output into the fixed space.
 - A roshambo2 shape/colour reward (CDK8 by default) and per-trajectory diversity and
   latency metrics are shared by both arms.
+
+Both arms can also be run on the **PMO benchmark** (Practical Molecular Optimization, Gao et
+al. 2022): all 23 tasks are available through `hbs/pmo.py`, with configs for `gsk3b`, `jnk3`,
+`drd2` and `amlodipine_mpo`. PMO is cheap where roshambo2 is expensive, so these runs are
+budgeted on oracle calls rather than steps and *can* be compared on wall time. See
+[`hbs/configs/README-pmo.md`](hbs/configs/README-pmo.md) for the protocol and
+[`SETUP.md`](SETUP.md) for the environment.
 
 The upstream README follows.
 

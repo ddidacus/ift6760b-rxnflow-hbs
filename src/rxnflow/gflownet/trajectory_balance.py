@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from rxnflow.core.types import Trajectory
+from rxnflow.gflownet.bck.objective import BackwardObjective
 from rxnflow.gflownet.policy import RxnFlowPolicy
 
 
@@ -33,9 +34,14 @@ class TrajectoryBalance:
         moo_scalarization: Literal["sum", "mul"],
         reward_floor: float,
         loss_fn: Literal["mse", "mae", "huber"] = "mse",
+        backward: BackwardObjective | None = None,
     ) -> None:
         if loss_fn not in ("mse", "mae", "huber"):
             raise ValueError("loss_fn must be mse, mae, or huber")
+        # A learned P_B is evaluated here with the current parameters (detached inside TB)
+        # and trained by its own loss. Without one, P_B is the float stored by the sampler
+        # (RxnFlow's heuristic).
+        self.backward = backward
         self.policy = policy
         self.moo_scalarization = moo_scalarization
         self.reward_floor = reward_floor
@@ -51,9 +57,9 @@ class TrajectoryBalance:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute conditional TB loss for online trajectories followed by replay."""
         assert num_online >= 0 and num_replay >= 0, "batch counts must be non-negative"
-        assert num_online + num_replay == len(trajectories), (
-            "batch counts must match trajectories"
-        )
+        assert num_online + num_replay == len(
+            trajectories
+        ), "batch counts must match trajectories"
         model = self.policy.model
         device = self.policy.device
 
@@ -94,14 +100,20 @@ class TrajectoryBalance:
         # 3. Score all observed transitions together, then sum by trajectory.
         transitions = []
         traj_indices: list[int] = []
-        traj_log_p_B = torch.tensor(
-            [
-                sum(step.log_p_B for step in trajectory.steps)
-                for trajectory in trajectories
-            ],
-            dtype=torch.float32,
-            device=device,
-        )
+        bck_output = None
+        if self.backward is not None:
+            # Learned P_B: constant inside TB, trained by its own loss (aux_loss).
+            bck_output = self.backward(trajectories)
+            traj_log_p_B = bck_output.traj_log_p_B.detach()
+        else:
+            traj_log_p_B = torch.tensor(
+                [
+                    sum(step.log_p_B for step in trajectory.steps)
+                    for trajectory in trajectories
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
         for traj_idx, trajectory in enumerate(trajectories):
             for transition in trajectory.steps:
                 transitions.append(transition)
@@ -133,6 +145,9 @@ class TrajectoryBalance:
         else:
             raise ValueError(f"Unknown loss_fn: {self.loss_fn}")
         loss = tb_losses.mean()
+        if bck_output is not None:
+            tb_loss = loss.detach()
+            loss = loss + bck_output.aux_loss
 
         # 5. Derive diagnostics from the same pre-update values without gradients.
         # "batch_entropy" is trajectory surprisal on this online+replay batch,
@@ -162,4 +177,8 @@ class TrajectoryBalance:
                 / (~is_valid).sum().clamp_min(1),
                 "invalid_trajectories": (~is_valid).float().mean(),
             }
+            if bck_output is not None:
+                info["tb_loss"] = tb_loss
+                info["bck_aux_loss"] = bck_output.aux_loss.detach()
+                info.update(bck_output.info)
         return loss, info

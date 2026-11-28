@@ -1,26 +1,7 @@
-"""The hashed reservoir: every building block, in fixed feature space, hashed once.
+"""Locality-sensitive hash over the fixed synthon features, built once per run.
 
-RxnFlow scores a synthon action as an inner product between a query the policy forms
-from the state (and reaction) and a *learned* embedding of the synthon. Learned
-embeddings move with every optimizer step, so any index over them is stale the moment
-it is built. Here the reservoir is each synthon's precomputed fingerprint instead --
-`library.fingerprints`, written once when the environment was prepared -- L2-normalized.
-That vector never changes, so the hash table is built once at the start of a run and is
-correct for its entire duration.
-
-The policy keeps its learned query head and adds a projection into this fixed space, so
-the inner product being ranked and the angle the hash estimates live in the same space.
-Learning stays on the query side, where it costs nothing to re-evaluate.
-
-What is stored per library: one int64 bit code per row, the row order that sorts those
-codes, and the offsets of each distinct code in that order. That is ~8 bytes a synthon,
-so the whole 482,070-synthon Enamine catalog indexes in a few megabytes and the
-fingerprints themselves are never copied -- rows are read straight out of the
-environment's uint8 arrays when a bucket is scored.
-
-Hyperplanes are shared by every library: all synthons are described in the same feature
-space, so one random orthogonal basis serves them all, and each library takes the first
-`depth` rows of it, where `depth` is chosen from its size.
+Random hyperplanes give every row a code. A query opens its own bucket first, then
+Hamming neighbours, until ``min_rows`` are in hand.
 """
 
 from __future__ import annotations
@@ -43,10 +24,8 @@ MAX_DEPTH = 62
 def probe_masks(depth: int, max_radius: int, limit: int) -> list[NDArray[np.int64]]:
     """Code offsets grouped by Hamming distance: [[0], single flips, double flips, ...].
 
-    Multi-probe visits buckets in order of Hamming distance from the query's own code
-    by XOR-ing the code with these, which costs C(depth, r) lookups at radius r instead
-    of scoring every occupied bucket. At depth 16 that is 1, 16, 120, 560, 1820 -- the
-    difference between a few thousand lookups and fifty thousand distance computations.
+    XOR-ing a code with these visits buckets nearest-first, at C(depth, r) lookups for
+    radius r rather than a distance to every occupied bucket.
     """
     levels: list[NDArray[np.int64]] = [np.zeros(1, dtype=np.int64)]
     total = 1
@@ -84,6 +63,11 @@ class LibraryIndex:
     order: NDArray[np.int64]
     bucket_codes: NDArray[np.int64]
     bucket_start: NDArray[np.int64]
+    # The partition as the policy scores it: each occupied code as +-1 per bit, and
+    # the bucket every row belongs to. <code, hyperplane scores> is a differentiable
+    # similarity whose argmax over all codes is the hash code itself.
+    code_signs: NDArray[np.float32]
+    row_bucket: NDArray[np.int64]
 
     @property
     def num_buckets(self) -> int:
@@ -100,10 +84,8 @@ class LibraryIndex:
 class HashedReservoir:
     """Fixed-feature hash tables for every library, built once.
 
-    lookup() answers with the rows of the bucket a query falls in, widening to the
-    nearest buckets in Hamming distance only when that bucket holds too few rows to
-    score at all. There is no sample size: the candidate set is whatever the opened
-    buckets contain, which is the point -- the full space is searched, not subsampled.
+    ``lookup`` returns the rows of the bucket a query falls in, widening to the nearest
+    buckets only when it holds too few. There is no sample size.
     """
 
     def __init__(
@@ -124,21 +106,16 @@ class HashedReservoir:
         if len(set(dims.values())) != 1:
             raise ValueError(f"libraries must share a feature space, got {dims}")
         self.dim = next(iter(dims.values()))
-        # One depth for every library: the code length is the resolution of the
-        # search, not a per-library budget. Deep codes make buckets small, so the
-        # candidate set is set by how many rows a lookup is asked to collect.
+        # One depth for every library: code length is the resolution of the search,
+        # not a per-library budget.
         self.depth = int(np.clip(depth, 1, MAX_DEPTH))
-        # Hashing about the origin estimates the angle the action logit actually
-        # ranks (query . unit-norm feature). Centring on the reservoir mean, as the
-        # reference implementation does, estimates the angle about the centroid
-        # instead -- which is only the same similarity when queries are distributed
-        # like the reservoir. Measured on this catalog, for queries that point at
-        # specific blocks, the origin wins (4.9x chance against 4.3x).
+        # Hashing about the origin estimates the angle the logit ranks. Centring on
+        # the reservoir mean estimates it about the centroid instead, which only
+        # matches when queries are distributed like the reservoir.
         self.center = center
         rng = np.random.default_rng(seed)
-        # One orthogonal basis for every library. Orthogonal rather than Gaussian
-        # hyperplanes (Super-Bit LSH) lowers the variance of the angle estimate, and
-        # is only defined for depth <= dim, which resolve_depth enforces.
+        # Orthogonal rather than Gaussian hyperplanes (Super-Bit LSH): lower variance
+        # on the angle estimate, defined only for depth <= dim.
         if self.depth > self.dim:
             raise ValueError(
                 f"depth {self.depth} exceeds the feature dimension {self.dim}: "
@@ -146,12 +123,9 @@ class HashedReservoir:
             )
         self.hyperplanes = ortho_group.rvs(self.dim, random_state=rng).astype(np.float32)
         self.masks = probe_masks(self.depth, max_radius, probe_limit)
-        # Two exact ways to visit buckets in Hamming order, each cheap in the regime
-        # the other is not. Multi-probe enumerates codes near the query, which costs
-        # C(depth, r) lookups and only reaches radius max_radius -- fine when occupied
-        # codes are dense, useless when a 129-row library scatters 113 codes over
-        # 65,536. Scoring every occupied bucket is exact at any distance and costs
-        # Q x B, which is nothing when B is small. Dispatch on B.
+        # Two exact ways to visit buckets in Hamming order, dispatched on bucket
+        # count: multi-probe enumerates nearby codes (cheap when codes are dense),
+        # the exact scan distances every occupied bucket (cheap when there are few).
         self.dense_buckets = dense_buckets
         # References, not copies: the environment already holds these arrays.
         self.features = features
@@ -187,6 +161,12 @@ class HashedReservoir:
             ([0], boundaries, [rows])
         ).astype(np.int64)
         bucket_codes = sorted_codes[start_positions[:-1]]
+        bits = (bucket_codes[:, None] >> np.arange(depth, dtype=np.int64)) & 1
+        code_signs = (bits * 2 - 1).astype(np.float32)
+        row_bucket = np.empty(rows, dtype=np.int64)
+        row_bucket[order] = np.repeat(
+            np.arange(len(bucket_codes), dtype=np.int64), np.diff(start_positions)
+        )
         return LibraryIndex(
             name=name,
             num_rows=rows,
@@ -195,6 +175,8 @@ class HashedReservoir:
             order=order,
             bucket_codes=bucket_codes,
             bucket_start=start_positions,
+            code_signs=code_signs,
+            row_bucket=row_bucket,
         )
 
     # ---- queries
@@ -212,10 +194,8 @@ class HashedReservoir:
     ) -> list[NDArray[np.int64]]:
         """Rows to score for each query, nearest bucket first.
 
-        Visits the query's own bucket, then buckets at Hamming distance 1, 2, ... and
-        stops once min_rows rows are in hand. The candidate set stays determined by
-        the hash and by the query -- nothing is drawn at random -- but it cannot
-        collapse to the handful of rows a single deep bucket holds.
+        Stops once ``min_rows`` rows are in hand. Nothing is drawn at random, but the
+        set cannot collapse to the few rows one deep bucket holds.
         """
         entry = self.index[library_name]
         codes = self.codes_of(library_name, queries)
@@ -224,9 +204,8 @@ class HashedReservoir:
             return self._lookup_dense(entry, codes, need)
         opened, short = self._lookup_probe(entry, codes, need)
         if short:
-            # Multi-probe exhausted its radius without filling these; the exact scan
-            # always can, and a query that needs it is by definition in a sparse part
-            # of the code space, so this stays rare.
+            # Multi-probe exhausted its radius; the exact scan always fills, and a
+            # query needing it sits in a sparse part of the code space.
             exact = self._lookup_dense(entry, codes[short], need)
             for position, rows in zip(short, exact, strict=True):
                 opened[position] = rows
@@ -270,10 +249,8 @@ class HashedReservoir:
             for local, query in enumerate(pending):
                 matched = slots[local][hit[local]]
                 if matched.size:
-                    # Sorted within the level, so buckets equidistant from the query
-                    # are opened in bucket order -- the same tie-break the exact scan
-                    # gets from a stable argsort, which is what makes the two paths
-                    # return identical sets rather than merely comparable ones.
+                    # Sorted within the level, so equidistant buckets open in bucket
+                    # order -- the exact scan's tie-break, so both paths agree.
                     collected[int(query)].extend(np.sort(matched).tolist())
             found[pending] += matched_sizes.sum(axis=1)
             pending = pending[found[pending] < need]
@@ -285,9 +262,8 @@ class HashedReservoir:
                 short.append(query)
                 results.append(np.empty(0, dtype=np.int64))
                 continue
-            # Stop at the first bucket that satisfies the floor: visiting a whole
-            # radius at a time would otherwise hand nearer-coded queries larger
-            # candidate sets than the exact scan gives.
+            # Stop at the first bucket that meets the floor, or nearer-coded queries
+            # would get larger candidate sets than the exact scan gives.
             total = 0
             opened = []
             for bucket in buckets:
@@ -308,6 +284,18 @@ class HashedReservoir:
             distance += ((differing >> np.int64(bit)) & 1).astype(np.int16)
         return distance
 
+    def partition_of(
+        self, library_name: str
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
+        """Hyperplanes, centroid and occupied codes, for scoring buckets in torch."""
+        entry = self.index[library_name]
+        return self.hyperplanes[: entry.depth], entry.mean, entry.code_signs
+
+    def rows_of_buckets(self, library_name: str) -> list[NDArray[np.int64]]:
+        """Rows held by each occupied bucket, indexed as ``code_signs`` is."""
+        entry = self.index[library_name]
+        return [entry.rows_in(b) for b in range(entry.num_buckets)]
+
     def codes_of(
         self, library_name: str, queries: NDArray[np.float32]
     ) -> NDArray[np.int64]:
@@ -322,9 +310,7 @@ class HashedReservoir:
     ) -> NDArray[np.float32]:
         """[queries, rows] exact inner products, for probes.
 
-        Chunked over rows: normalising a 92,813-row library in one piece costs 250MB,
-        which is not worth spending periodically alongside a training job. The score
-        matrix itself is small (queries x rows).
+        Chunked over rows: normalizing the largest library in one piece costs 250MB.
         """
         values = self.features[library_name]
         scores = np.empty((len(queries), len(values)), dtype=np.float32)

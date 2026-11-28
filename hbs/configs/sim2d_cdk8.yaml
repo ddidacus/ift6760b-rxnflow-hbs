@@ -1,0 +1,22 @@
+# RxnFlow on the CDK8 reference ligand, scored by 2D fingerprint similarity.
+#
+# cdk8_enamine.yaml with the reward swapped: same catalog, same beta, same
+# subsampling, same property penalty, so a pair of runs here is comparable with
+# the roshambo2 pair on the same target and the difference between them is the
+# objective alone. The reward needs no conformers and no GPU, so a step costs
+# what generation and the loss pass cost and nothing more.
+env_dir: ./data/envs/enamine_290k/
+
+reward:
+  beta: "32"
+  settings:
+    kind: sim2d
+    target: cdk8
+
+subsampling:
+  sampling_ratio: 0.1
+  min_sampling: 50
+  importance_temp: 1.0
+
+property_penalty:
+  mw: 500

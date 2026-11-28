@@ -32,6 +32,7 @@ class SynthesisEnv:
         min_reactions: int = 1,
         property_penalty: dict[str, float] | None = None,
         retrosynthesis_workers: int = 0,
+        one_step_cache_size: int = 200_000,
     ):
         self.env_dir = Path(env_dir)
         self.max_atoms = max_atoms
@@ -53,6 +54,7 @@ class SynthesisEnv:
             for name, limit in (property_penalty or {}).items()
         }
         self.retrosynthesis_workers = retrosynthesis_workers
+        self.one_step_cache_size = one_step_cache_size
         self.signature = json.loads((self.env_dir / "signature.json").read_text())
         check_library_compatibility(self.signature["rxnflow_version"])
         self._load_libraries()
@@ -204,7 +206,11 @@ class SynthesisEnv:
 
     @cached_property
     def retro_analyzer(self) -> RetroSynthesisAnalyzer:
-        return RetroSynthesisAnalyzer(self, self.retrosynthesis_workers)
+        return RetroSynthesisAnalyzer(
+            self,
+            self.retrosynthesis_workers,
+            one_step_cache_size=self.one_step_cache_size,
+        )
 
     def close(self) -> None:
         """Release reverse-search workers without creating an unused analyzer."""
@@ -219,6 +225,24 @@ class SynthesisEnv:
     @staticmethod
     def is_terminal(state: State) -> bool:
         return state.terminated
+
+    @staticmethod
+    def parent_counts(
+        action: Action, reactions: int, synthons: int
+    ) -> tuple[int, int] | None:
+        """Counters of the state reached by undoing `action`, or None if there is none.
+
+        Undoing FirstSynthon must land on the empty state, so it is available only from a
+        state built from exactly one synthon and no reaction; every other reverse step
+        must leave a state that still holds a synthon. This is what makes P_B a
+        distribution over the parents of `(molecule, reactions, synthons)` rather than
+        over the reverse steps of the molecule alone.
+        """
+        cost_r, cost_s = action.action_type.cost
+        reactions, synthons = reactions - cost_r, synthons - cost_s
+        if action.action_type.is_first:
+            return (0, 0) if (reactions, synthons) == (0, 0) else None
+        return (reactions, synthons) if reactions >= 0 and synthons >= 1 else None
 
     @staticmethod
     def get_synthon_types(smiles: str) -> tuple[int, ...]:

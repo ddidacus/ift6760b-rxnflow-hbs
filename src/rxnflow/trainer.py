@@ -21,6 +21,8 @@ from rxnflow.conditioning import ConditioningModule
 from rxnflow.config import Config
 from rxnflow.core.types import Trajectory
 from rxnflow.envs.env import SynthesisEnv
+from rxnflow.gflownet.bck.objective import BackwardObjective
+from rxnflow.gflownet.bck.policy import BackwardPolicy
 from rxnflow.gflownet.conditioning import ConditionSampler
 from rxnflow.gflownet.policy import RxnFlowPolicy
 from rxnflow.gflownet.property_penalty import compute_property_rewards
@@ -136,6 +138,7 @@ class RxnFlowTrainer:
             cfg.generation.min_reactions,
             cfg.property_penalty,
             self.num_workers,
+            one_step_cache_size=cfg.backward.cache_size,
         )
         logger.info(
             "Environment loaded: %s libraries, %s synthons.",
@@ -150,10 +153,12 @@ class RxnFlowTrainer:
             self.conditioning.encoding_dim if self.conditioning is not None else None
         )
         self.model = RxnFlowModel(
-            self.env, cfg.model, self.num_objectives, condition_dim
+            self.env, cfg.model, self.num_objectives, condition_dim, cfg.backward
         ).to(self.device)
         self.sampling_model = (
-            RxnFlowModel(self.env, cfg.model, self.num_objectives, condition_dim)
+            RxnFlowModel(
+                self.env, cfg.model, self.num_objectives, condition_dim, cfg.backward
+            )
             .to(self.device)
             .eval()
         )
@@ -176,14 +181,27 @@ class RxnFlowTrainer:
             if not name.startswith("_logZ.")
         ]
         self.log_z_parameters = list(self.model._logZ.parameters())
+        groups = [
+            {"params": self.policy_parameters},
+            {
+                "params": self.log_z_parameters,
+                "lr": cfg.training.learning_rate_logZ,
+            },
+        ]
+        head = self.model.backward_head
+        if head is not None and cfg.backward.learning_rate is not None:
+            # The backward head gets its own learning rate; gradient clipping still
+            # covers it through policy_parameters. Appended last so group 0 stays the
+            # policy group the learning-rate log reports.
+            head_ids = {id(p) for p in head.parameters()}
+            groups[0] = {
+                "params": [p for p in self.policy_parameters if id(p) not in head_ids]
+            }
+            groups.append(
+                {"params": list(head.parameters()), "lr": cfg.backward.learning_rate}
+            )
         self.optimizer = torch.optim.Adam(
-            [
-                {"params": self.policy_parameters},
-                {
-                    "params": self.log_z_parameters,
-                    "lr": cfg.training.learning_rate_logZ,
-                },
-            ],
+            groups,
             lr=cfg.training.learning_rate,
             weight_decay=cfg.training.weight_decay,
         )
@@ -205,11 +223,24 @@ class RxnFlowTrainer:
         """Initialize the gfn training components"""
         cfg = self.config
 
+        self.backward_policy: BackwardPolicy | None = None
+        backward_objective = None
+        if cfg.backward.learned:
+            self.backward_policy = BackwardPolicy(
+                self.env, self.model, cfg, self.device
+            )
+            backward_objective = BackwardObjective(
+                self.backward_policy,
+                cfg.backward,
+                replay=self.replay,
+                rng=self.rng,
+            )
         self.tb = TrajectoryBalance(
             self.policy,
             cfg.reward.moo_scalarization,
             cfg.training.reward_floor,
             loss_fn=cfg.training.loss_fn,
+            backward=backward_objective,
         )
         self.step = 0
         self.condition_sampler: ConditionSampler = ConditionSampler(
@@ -449,6 +480,9 @@ class RxnFlowTrainer:
                     cond=cond,
                     cond_list=cond_list,
                     random_action_prob=self.config.training.random_action_prob,
+                    # A learned P_B scores one-step reverse candidates, so the
+                    # recursive route search is not needed to fill log_p_B.
+                    analyze_backward=not self.config.backward.learned,
                 )
                 sample_time = perf_counter() - started
                 self._assign_rewards(online_trajs)

@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from hbs.metrics import count_scaffolds, morgan_packed, tanimoto_diversity
+from rxnflow.gflownet.fwd.metrics import count_scaffolds, morgan_packed, tanimoto_diversity
 
 TOPK = (10, 100, 1000)
 CIRCLE_THRESHOLDS = (0.75, 0.5)
@@ -67,7 +67,7 @@ def num_circles(smiles: list[str], threshold: float) -> int:
     """Molecules kept when each must be > threshold Tanimoto distance from all kept ones."""
     import math
 
-    from hbs.metrics import _popcount
+    from rxnflow.gflownet.fwd.metrics import _popcount
 
     kept: list[np.ndarray] = []
     for smi in smiles:
@@ -83,6 +83,55 @@ def num_circles(smiles: list[str], threshold: float) -> int:
                 continue
         kept.append(packed)
     return len(kept)
+
+
+def modes_found(
+    records: list[tuple[str, float]],
+    reward_threshold: float,
+    similarity_threshold: float = 0.7,
+) -> list[int]:
+    """Running count of distinct high-reward modes, in discovery order.
+
+    The standard GFlowNet sample-efficiency measure: a molecule counts as a new mode
+    when it clears ``reward_threshold`` *and* is below ``similarity_threshold`` Tanimoto
+    to every mode already counted. Plotted against oracle calls it answers "how fast
+    does this method find *distinct* good chemotypes", which neither ``avg_top_k`` nor
+    ``auc_top_10`` can: a hill-climber that collapses onto one scaffold scores well on
+    both while finding a single mode. That separation is the reason a GFlowNet is being
+    used at all, so it is the right thing to measure it on.
+
+    ``records`` is (smiles, reward) in the order the oracle saw them, so the returned
+    list is indexed by oracle call and its last entry is the total at that budget.
+    Modes are counted greedily in discovery order rather than best-first: the question
+    is when a mode was *found*, not how the final set would be summarized.
+    """
+    from rxnflow.gflownet.fwd.metrics import _popcount
+
+    kept: list[np.ndarray] = []
+    curve: list[int] = []
+    for smiles, reward in records:
+        if reward >= reward_threshold:
+            packed = morgan_packed(smiles)
+            if packed is not None:
+                if kept:
+                    stack = np.stack(kept)
+                    shared = _popcount(np.bitwise_and(packed, stack))
+                    union = _popcount(packed) + _popcount(stack) - shared
+                    similarity = np.where(union > 0, shared / np.maximum(union, 1), 1.0)
+                    if similarity.max() < similarity_threshold:
+                        kept.append(packed)
+                else:
+                    kept.append(packed)
+        curve.append(len(kept))
+    return curve
+
+
+def calls_to_modes(curve: list[int], target: int) -> int | None:
+    """Oracle calls needed to reach ``target`` modes, or None if never reached."""
+    for calls, found in enumerate(curve, start=1):
+        if found >= target:
+            return calls
+    return None
 
 
 def auc_top_10(curve: list[tuple[int, float]]) -> float:

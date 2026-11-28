@@ -23,6 +23,9 @@ ActionSpace = list["ActionSubspace"]
 # state's SMILES "" through FirstSynthon. The number of entries is the route length.
 BackwardTrajectory = list[tuple["Action", str]]
 
+# One reverse step: (forward action, parent SMILES); the empty state's SMILES is "".
+BackwardEdge = tuple["Action", str]
+
 # Named external conditions, e.g. pocket keys or target property values.
 Condition: TypeAlias = dict[str, Any]
 
@@ -47,6 +50,16 @@ class ActionType(IntEnum):
     @property
     def is_birxn(self) -> bool:
         return self in (ActionType.BIRXN_BRICK, ActionType.BIRXN_LINKER)
+
+    @property
+    def cost(self) -> tuple[int, int]:
+        """(reactions, synthons) this action type consumes.
+
+        The MDP's counting rule, stated once: FirstSynthon spends a synthon but no
+        reaction, a unimolecular reaction spends a reaction but no synthon, and a
+        bimolecular reaction spends one of each.
+        """
+        return (0 if self.is_first else 1, 0 if self.is_unirxn else 1)
 
 
 @dataclass(frozen=True)

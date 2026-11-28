@@ -1,36 +1,6 @@
-"""Per-trajectory diversity and latency metrics, identical in both arms.
+"""Per-trajectory diversity, candidate-set and latency metrics, identical in all arms.
 
-Three families, all recorded per trajectory of the online batch:
-
-1. ``block_div_library`` / ``block_div_union`` -- Tanimoto diversity of the synthon
-   rows the policy actually scored at each step of the trajectory. ``library`` averages
-   the diversity computed within each subsampled (reaction, library) subspace; ``union``
-   takes the whole candidate set of that step as one pool. This is the metric that sees
-   the mechanism: uniform subsampling draws rows without looking at the query, so its
-   candidate sets should be as diverse as the library, while HBS retrieval returns rows
-   near the query and should be tighter.
-
-2. ``route_scaffolds`` / ``route_div`` -- over the molecules a trajectory actually built:
-   every selected synthon plus every obtained product, including the final molecule.
-   Scaffolds are Bemis-Murcko; diversity is the same 1 - mean pairwise Tanimoto.
-
-3. ``latency_ms`` / ``policy_ms`` -- wall clock from the start of the batch's sampling
-   until that trajectory was complete, and the share of it spent inside its own forward
-   passes. RxnFlow advances the whole batch in lockstep, one batched forward call per
-   step, so a trajectory of L steps finished during iteration L-1 and its latency is
-   read off the start of iteration L (or the end of sampling for the last iteration).
-   That is a real end-to-end number -- it includes chemistry, masking and the backward
-   analysis of that step -- but it is the time at which the trajectory became complete
-   inside a batch, not what the trajectory would cost sampled alone.
-
-Fingerprints are Morgan, radius 2, 2048 bits, bit-packed to 256 bytes; diversity is
-1 - mean pairwise Tanimoto similarity, the definition in ``molgen/utils/diversity.py``.
-Sets with more than ``max_pairs`` pairs are estimated from that many random pairs, and
-every record carries the pair count behind it.
-
-Nothing here changes sampling. The collector reads the action categorical the policy
-already built, draws from its own RNG, and never touches the trainer's generator, so a
-run with metrics on and a run with them off produce the same trajectories.
+One JSONL record per measured step. ``MetricsSettings`` sets the cadence.
 """
 
 from __future__ import annotations
@@ -155,9 +125,8 @@ def murcko_scaffold(smiles: str) -> str | None:
     try:
         scaffold = MurckoScaffold.GetScaffoldForMol(mol)
     except Exception:
-        # GetScaffoldForMol re-runs the valence check on the pruned scaffold and
-        # raises for molecules MolFromSmiles accepted; the repo's scaffold tracker
-        # hit this in production. Treat it as "no scaffold" rather than failing a run.
+        # GetScaffoldForMol re-runs the valence check and raises for molecules
+        # MolFromSmiles accepted; treat that as "no scaffold", not a failed run.
         return None
     return None if scaffold is None else Chem.MolToSmiles(scaffold)
 
@@ -180,9 +149,8 @@ class MetricsSettings:
     # Pair budget per diversity estimate; a candidate set of 167 rows is exact under
     # 2000 only up to 63 rows, so library-level numbers are sampled estimates.
     max_pairs: int = 2000
-    # Rows drawn once per library to estimate the library's own diversity, which is
-    # the scale a candidate set's diversity has to be read against. Fingerprinting
-    # is the cost, so this stays small and is paid once per library.
+    # Rows drawn once per library to estimate its own diversity, the scale a
+    # candidate set is read against. Fingerprinting is the cost, so keep it small.
     reference_rows: int = 256
     seed: int = 0
 
@@ -206,12 +174,10 @@ class SynthonFingerprints:
         self.failures = 0
 
     def reference(self, library_name: str, sample: int, rng, max_pairs: int) -> float:
-        """The library's own diversity: what a candidate set's diversity means.
+        """The library's own diversity: the scale a candidate set is read against.
 
-        A uniform candidate set should land near this; a retrieved one below it. Without
-        it, a candidate diversity of 0.83 has no scale to be read against. Estimated
-        once per library from `sample` random rows, since fingerprinting the whole
-        catalog for a reference number is not worth it.
+        A uniform candidate set should land near this, a retrieved one below it.
+        Estimated once per library from ``sample`` random rows.
         """
         cached = self._reference.get(library_name)
         if cached is not None:
@@ -386,9 +352,8 @@ class TrajectoryMetrics:
         lengths = [len(value.steps) for value in trajectories]
         iterations = len(self._iteration_start)
 
-        # A trajectory of L steps was advanced in iterations 0..L-1 and was complete
-        # by the start of iteration L. Positions within an iteration follow the same
-        # increasing-index order the sampler uses, so they map back exactly.
+        # A trajectory of L steps was advanced in iterations 0..L-1. Positions within
+        # an iteration follow the sampler's own index order, so they map back exactly.
         latency_ms: list[float] = []
         policy_ms: list[float] = []
         for length in lengths:

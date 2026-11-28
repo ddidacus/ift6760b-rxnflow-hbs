@@ -8,7 +8,7 @@ backend), so the numbers this produces sit on the same scale as those, and as th
 GFlowNet baseline's proxy in ``baselines/gflownet/gflownet/proxy/roshambo2.py``.
 
 The default query is CDK8. Query SDFs are shared, at ``support/queries`` in the
-top level of this package.
+top level of this package, and resolved by ``hbs.queries``.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import logging
 import multiprocessing
 import os
 import time
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -33,6 +32,8 @@ from roshambo2 import Roshambo2
 
 from rxnflow import RewardFunction
 
+from hbs.queries import read_query_mol, resolve_query_path
+
 logger = logging.getLogger(__name__)
 RDLogger.DisableLog("rdApp.*")
 
@@ -42,40 +43,6 @@ RDLogger.DisableLog("rdApp.*")
 Chem.SetDefaultPickleProperties(
     Chem.PropertyPickleOptions.AllProps | Chem.PropertyPickleOptions.ComputedProps
 )
-
-def _find_query_dir() -> Path:
-    """Locate support/queries without assuming where this package was installed.
-
-    ROSHAMBO_QUERY_DIR wins when set; otherwise the nearest support/queries at or
-    above this file is used, so the package works both inside this repository's
-    baselines tree and copied into a standalone RxnFlow checkout that carries its
-    own support/queries. Resolution is deferred to call time: an absolute
-    sdf_path never needs it.
-    """
-    override = os.environ.get("ROSHAMBO_QUERY_DIR")
-    if override:
-        return Path(override)
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / "support" / "queries"
-        if candidate.is_dir():
-            return candidate
-    raise FileNotFoundError(
-        "no support/queries directory found above "
-        f"{Path(__file__).resolve()}; set ROSHAMBO_QUERY_DIR or pass sdf_path"
-    )
-
-TARGET_FILES = {
-    "cdk8": "CDK8_insilico.sdf",
-    "biib68": "BIIB68_bioactive.sdf",
-    "bmsbtk_6o8i": "bmsBTK_6O8I_bioactive.sdf",
-    "gsm_pf-06648671": "gsm_PF-06648671_bioactive.sdf",
-    "gsm_ro7185876": "gsm_RO7185876_bioactive.sdf",
-    "irak4_8ucc": "irak4_8UCC_bioactive.sdf",
-    "nfkb_z9j": "NFKb_Z9j_bioactive.sdf",
-    "nimbusbtk_8s99": "NimbusBTK_8S99_bioactive.sdf",
-    "tyk2_8tb5": "tyk2_8TB5_bioactive.sdf",
-}
-
 
 # ======== Conformer preparation
 # Module level so the worker pool can pickle them.
@@ -145,7 +112,8 @@ class Roshambo2Reward(RewardFunction):
         Arguments
         ---------
         target
-            A key of ``TARGET_FILES``, resolved against ``support/queries``.
+            A key of ``hbs.queries.TARGET_FILES``, resolved against
+            ``support/queries``.
             Ignored when ``sdf_path`` is given.
         sdf_path
             Any other query molecule, for a target outside that set.
@@ -161,16 +129,7 @@ class Roshambo2Reward(RewardFunction):
             64-molecule batch takes ~0.1-2s, so this only ever cuts a true hang;
             the molecules it drops score 0.
         """
-        if sdf_path is None:
-            if target not in TARGET_FILES:
-                raise ValueError(
-                    f"target must be one of {sorted(TARGET_FILES)}, got {target!r}; "
-                    "pass sdf_path for a target outside this set"
-                )
-            sdf_path = str(_find_query_dir() / TARGET_FILES[target])
-        query_path = Path(sdf_path)
-        if not query_path.is_file():
-            raise FileNotFoundError(f"query molecule not found: {query_path}")
+        query_path = resolve_query_path(target, sdf_path)
 
         self.target = target
         self.sdf_path = str(query_path)
@@ -183,9 +142,7 @@ class Roshambo2Reward(RewardFunction):
         self.prep_timeout = prep_timeout
         self.backend = backend
 
-        self.query_mol = Chem.SDMolSupplier(self.sdf_path)[0]
-        if self.query_mol is None:
-            raise ValueError(f"failed to read a reference molecule from {query_path}")
+        self.query_mol = read_query_mol(query_path)
 
         # One pool for the run. Rebuilding it per call dominated the step time when
         # this reward was profiled in the parent package: fork cost grows with the

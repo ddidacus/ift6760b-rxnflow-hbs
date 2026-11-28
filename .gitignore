@@ -28,3 +28,9 @@ data/catalogs/
 
 # Agent
 .claude
+
+# TDC oracle checkpoints (downloaded on demand)
+oracle/
+
+# Data
+data/downloads

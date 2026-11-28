@@ -1,43 +1,14 @@
-"""RxnFlow policy that searches the whole building-block space, without subsampling.
+"""Action selection by hashed lookup over the whole catalog, instead of subsampling.
 
-Upstream scores a synthon action as an inner product between a query the policy forms
-from the state (and reaction) and a *learned* embedding of the synthon, and keeps that
-affordable by scoring K of each library's N rows drawn uniformly, correcting the
-partition estimate with log(N/K). That correction is the price of not looking at the
-other N-K rows.
-
-This policy removes the subsample. The reservoir -- every row of every library -- is
-hashed once at the start of a run in *fixed* feature space (``hbs/reservoir.py``:
-precomputed fingerprints, L2-normalized, so the vectors never move and the table is
-never rebuilt). An action is scored by hashing its query into the same space, opening
-the bucket the query falls in, and taking inner products against that bucket's rows
-only. There is no K and no importance correction: the bucket *is* the candidate set and
-the normalization over it is exact.
-
-Learning stays on the query side. Upstream's action heads are kept as they are, and one
-``Linear(synthon_dim -> feature_dim)`` owned by the model projects their output into the
-fixed feature space, so the inner product being ranked and the angle the hash estimates
-live in the same space. Because only the query moves, the index stays valid for the
-whole run, and nothing in the action path has to be re-encoded.
-
-What this costs, against upstream:
-
-* The synthon encoder leaves the action path. A logit is now linear in the fingerprint
-  bits with state-dependent coefficients, where upstream's was ``query . MLP(bits)``.
-  That is strictly less expressive, and it is the deliberate trade for a static index.
-* Candidate sets are query-dependent and uneven. Bucket occupancy in fingerprint space
-  is clustered, so one state may score a few dozen rows and another a few thousand.
-  ``min_rows`` only guards the degenerate case of a bucket too small to score at all.
-* Reachability is no longer guaranteed. A row outside the query's bucket cannot be
-  selected at that step, where uniform subsampling gave every row probability K/N.
-  ``get_action_logits`` still scores an observed action directly, so replayed and
-  retrosynthesis-derived trajectories keep a finite forward logit.
+Candidates are the bucket the projected query hashes into plus a uniform draw, each
+row carrying its own importance weight. Only the query moves, so the index built at the
+start of a run stays valid for all of it.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -55,6 +26,13 @@ from rxnflow.core.types import (
 from rxnflow.envs.env import SynthesisEnv
 from rxnflow.envs.features import PROPERTY_DIM
 from rxnflow.envs.graph import GraphBatch
+from rxnflow.gflownet.fwd.base import MetricsPolicyMixin, StepClock, Temperature
+from rxnflow.gflownet.fwd.hbs.reservoir import HashedReservoir
+from rxnflow.gflownet.fwd.sampling import (
+    ComplementSampler,
+    WeightedActionCategorical,
+    uniform_budget,
+)
 from rxnflow.gflownet.policy import (
     ActionCategorical,
     ActionLogits,
@@ -63,9 +41,6 @@ from rxnflow.gflownet.policy import (
 )
 from rxnflow.gflownet.property_penalty import get_property_penalty, get_size_mask
 from rxnflow.models import RxnFlowModel
-
-from hbs.metrics import TrajectoryMetrics
-from hbs.reservoir import HashedReservoir
 
 logger = logging.getLogger(__name__)
 
@@ -81,48 +56,52 @@ _REACTION_TYPES = (
 class HBSSettings:
     """Settings for bucket-based candidate selection over the fixed reservoir."""
 
-    # Hyperplanes, so 2^depth cells: the resolution of the search, one value for every
-    # library. Deep codes make buckets small -- at 16 the median bucket holds a single
-    # row -- so depth sets how finely the space is cut and min_rows sets how much of it
-    # a step actually scores.
+    # Hyperplanes, so 2^depth buckets: the resolution of the search. Deep codes make
+    # buckets small, so depth cuts the space and min_rows sets what a step scores.
     depth: int = 16
-    # Candidates to collect before stopping: the query's own bucket first, then its
-    # Hamming neighbours until this many rows are in hand. Buckets are always opened
-    # nearest-first, so a small bucket beside the query is never skipped for being
-    # small -- this floor only decides how much further out the search reaches. A large
-    # floor therefore adds *more distant* blocks rather than rescuing near ones, and a
-    # small floor keeps the offer tight around the query. At depth 16 over 48,739 blocks
-    # the median bucket holds one row, so this value sets the candidate budget almost
-    # exactly. It needs the jitter (noise_sigma) to supply coverage over time, since a
-    # tight offer repeated every step is what collapsed catalog usage to 2.3%.
+    # Rows to collect before stopping, the query's bucket first and then its Hamming
+    # neighbours. Buckets open nearest-first, so this sets how far out the offer
+    # reaches, not which near blocks are kept. Pair a small value with noise_sigma.
     min_rows: int = 16
+    # Bucket *plus* a uniform draw, each row importance-weighted (fwd/sampling.py).
+    # Off is provably biased -- it cost ~15.5 nats of logZ on jnk3 -- and kept only to
+    # reproduce the pre-fix runs.
+    hybrid: bool = True
+    # Rows in the uniform half. None takes upstream's K for each library, so the
+    # uniform half *is* the baseline arm's estimator and logZ is comparable.
+    uniform_rows: int | None = None
+    # Weight applied to the row importances inside the *proposal* (not the
+    # normalization). 0 proposes from the policy's raw preference over offered rows.
+    explore_temp: float = 0.0
     # Calls between retrieval-quality probes against the exact inner products; 0 off.
     probe_every: int = 200
     # Seed for the shared hyperplanes.
     seed: int = 0
-    # Scale of the deterministic jitter added to the probe *before hashing only*, in
-    # units of the probe's own norm. This is the one knob that gives the offered block
-    # set temporal variation: at 0 the set is a deterministic function of the state and
-    # changes only as the policy drifts, which is what collapsed the catalog coverage to
-    # 2.3% of the largest group against the baseline's 32%. The jitter is a function of
-    # (seed, step, group), never fresh randomness, so sampling and the loss within one
-    # step open the same buckets and the normalization over them stays exact.
+    # Jitter added to the probe before hashing only, in units of its own norm: the
+    # one knob that moves the offered block set over time (at 0 it is a deterministic
+    # function of the state). A function of (seed, step, group), never fresh
+    # randomness, so sampling and the loss open the same buckets.
     noise_sigma: float = 0.0
     noise_seed: int = 0
-    # L2-normalize the probe before the dot product, making a synthon logit a pure
-    # cosine and leaving logit_scale as the only temperature. Off by default, which
-    # is upstream's convention (it normalizes the synthon side, not the query), but
-    # that convention assumes nothing downstream depends on the query's direction.
-    # Here the hash sees direction only, so an unnormalized probe can absorb gradient
-    # in its magnitude while its direction drifts out of the cone the non-negative
-    # fingerprints occupy -- measured in this run at step 200, cos_best fell 0.139 ->
-    # 0.059 and bucket recall 2.9% -> 1.2% together. Normalizing couples every unit of
-    # gradient to the direction retrieval actually uses.
+    # L2-normalize the probe, so a logit is a pure cosine. Off is upstream's
+    # convention, but the hash sees direction only: an unnormalized probe can absorb
+    # gradient in its magnitude while its direction drifts out of the fingerprint cone.
     normalize_probe: bool = False
-    # Hash about the reservoir's centroid instead of the origin. Off by default:
-    # the logit ranks cosine about the origin, so that is what the hash should
-    # estimate. See HashedReservoir.
+    # Hash about the reservoir centroid instead of the origin. Off: the logit ranks
+    # cosine about the origin, so that is what the hash should estimate.
     center: bool = False
+    # Score one bucket by <code, hyperplane scores> -- differentiable, and its argmax
+    # over all codes is the hash code itself -- instead of walking a Hamming ball and
+    # adding a uniform draw. min_rows, hybrid and uniform_rows are unused when on.
+    hierarchical: bool = False
+    # Where log P(bucket) enters the loss. "numerator" is P_F = P(bucket)P(row|bucket),
+    # which is what gives the probe pressure to open a better bucket, and leaves P_F
+    # summing to P(bucket) over the opened rows. "partition" adds it on both sides, so
+    # P_F is exactly normalized over the opened set but the term only moves mass
+    # between subspaces. "off" is the cell-is-the-action-space reading.
+    bucket_term: str = "numerator"
+    temp_bucket: Temperature = field(default_factory=Temperature)
+    temp_nn: Temperature = field(default_factory=Temperature)
 
     def validate(self) -> None:
         if self.depth < 1:
@@ -131,6 +110,16 @@ class HBSSettings:
             raise ValueError("hbs.noise_sigma must be non-negative (0 disables)")
         if self.min_rows < 1:
             raise ValueError("hbs.min_rows must be positive")
+        if self.uniform_rows is not None and self.uniform_rows < 0:
+            raise ValueError("hbs.uniform_rows must be non-negative or None")
+        if self.explore_temp < 0:
+            raise ValueError("hbs.explore_temp must be non-negative")
+        if not self.hybrid:
+            logger.warning(
+                "hbs.hybrid is off: the partition will be estimated over the bucket "
+                "only and declared as the whole library, which is biased. See "
+                "fwd/sampling.py; this reproduces the pre-fix behaviour."
+            )
         if self.min_rows < 64 and self.noise_sigma <= 0:
             logger.warning(
                 "hbs.min_rows=%d with no jitter offers the same ~%d blocks every step; "
@@ -139,76 +128,16 @@ class HBSSettings:
             )
         if self.probe_every < 0:
             raise ValueError("hbs.probe_every must be non-negative (0 disables)")
-class StepClock:
-    """Counts sampling calls, so the probe jitter is a function of the step.
-
-    The sampling policy advances it at the start of each batch; the training policy
-    reads the same value when it scores that batch, so both open the same buckets.
-    """
-
-    def __init__(self, value: int = 0):
-        self.value = int(value)
-
-    def advance(self) -> None:
-        self.value += 1
-
-
-class MetricsPolicyMixin:
-    """Times lockstep sampling and exposes the candidate sets, changing nothing.
-
-    A policy mixes this in and calls ``_record_candidates`` at the end of its
-    ``get_action_categorical``. Every hook is inert until a collector is attached,
-    and none of them touches logits, the action distribution or the trainer's RNG,
-    so both arms sample exactly what they would sample without it.
-    """
-
-    metrics: TrajectoryMetrics | None = None
-    _measuring: list[State] | None = None
-
-    def attach_metrics(self, collector: TrajectoryMetrics | None) -> None:
-        self.metrics = collector
-
-    def sample_from_model(self, *args, **kwargs):
-        clock = getattr(self, "clock", None)
-        if clock is not None:
-            clock.advance()
-        if self.metrics is None:
-            return super().sample_from_model(*args, **kwargs)
-        self.metrics.begin_sampling()
-        try:
-            return super().sample_from_model(*args, **kwargs)
-        finally:
-            self.metrics.end_sampling()
-
-    def sample_actions(self, states: list[State], *args, **kwargs):
-        if self.metrics is None:
-            return super().sample_actions(states, *args, **kwargs)
-        self.metrics.begin_iteration()
-        # Identity, not equality: only the categorical built for this very call is
-        # a sampling-time candidate set. log_prob() builds its own for the loss.
-        self._measuring = states
-        try:
-            return super().sample_actions(states, *args, **kwargs)
-        finally:
-            self._measuring = None
-            self.metrics.end_iteration()
-
-    def _record_candidates(
-        self, states: list[State], categorical: ActionCategorical
-    ) -> None:
-        if self.metrics is not None and self._measuring is states:
-            self.metrics.record_candidates(states, categorical)
-
-
-class InstrumentedPolicy(MetricsPolicyMixin, RxnFlowPolicy):
-    """Upstream policy with the metric hooks and no behavioural change."""
-
-    def get_action_categorical(
-        self, states: list[State], *args, **kwargs
-    ) -> ActionCategorical:
-        categorical = super().get_action_categorical(states, *args, **kwargs)
-        self._record_candidates(states, categorical)
-        return categorical
+        if self.bucket_term not in ("numerator", "partition", "off"):
+            raise ValueError("hbs.bucket_term must be numerator, partition or off")
+        self.temp_bucket.validate("hbs.temp_bucket")
+        self.temp_nn.validate("hbs.temp_nn")
+        if self.hierarchical and self.depth > 12:
+            logger.warning(
+                "hbs.depth=%d with one bucket per state: the median bucket holds a "
+                "single row, so P(row|bucket) is degenerate. Use depth 8-10.",
+                self.depth,
+            )
 
 
 class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
@@ -233,25 +162,80 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
         self.reservoir = reservoir
         # Owned by the model so the optimizer and the EMA copy both see it.
         self.projection = projection
-        # Every library is scored over a bucket, never over a sample, so there is no
-        # inclusion probability to correct for: log(N/N) = 0 leaves log_partition and
-        # the sampler's importance term untouched, and the normalization over the
-        # opened bucket is exact.
+        # Left at log(N/N) = 0 and kept only for inherited code paths: with a hybrid
+        # candidate set the correction is per row, and travels in
+        # WeightedActionCategorical.partition_weights instead.
         self.subsampling = {
             name: SubsamplingPolicy(len(library), 1.0, len(library), rng)
             for name, library in env.synthons.items()
         }
         self._calls = 0
+        # Uniform half of the candidate set, on its own generator so enabling the
+        # hybrid does not shift the policy's rng stream.
+        self._library_sizes = {name: len(lib) for name, lib in env.synthons.items()}
+        self._complement = ComplementSampler(
+            self._library_sizes, np.random.default_rng(rng.integers(2**63))
+        )
+        self._uniform_k = {
+            name: (
+                settings.uniform_rows
+                if settings.uniform_rows is not None
+                else uniform_budget(
+                    size,
+                    config.subsampling.sampling_ratio,
+                    config.subsampling.min_sampling,
+                )
+            )
+            for name, size in self._library_sizes.items()
+        }
         self._probe_library = max(env.synthons, key=lambda n: len(env.synthons[n]))
-        # cos(projected query, fingerprint of the action actually selected), averaged
-        # over the last scored batch. This is the quantity TB's numerator pulls on, so
-        # it is the direct answer to "is the probe learning the reservoir's space" --
-        # and unlike a probe it costs nothing and sees every action in the batch.
+        # cos(projected query, fingerprint of the selected action) over the last
+        # batch: whether the probe is learning the reservoir's space.
+        self._partition_cache: dict[str, tuple[torch.Tensor, ...]] = {}
+        self._bucket_rows: dict[str, list[NDArray[np.int64]]] = {}
+        # Mean log P(opened bucket) over the batch, as cell_logp is for CAS.
+        self.bucket_logp: float | None = None
         self.alignment: float | None = None
         # Mean number of code bits that changed since the previous call, which is how
         # the jitter scale should actually be read.
         self._drift: list[float] = []
         self.bits_flipped: float | None = None
+
+    def _row_temperature(self) -> float:
+        """Temperature of the within-bucket row softmax at this step."""
+        return self.hbs.temp_nn.at(self.clock.value) if self.hbs.hierarchical else 1.0
+
+    def _partition(self, library_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """This library's hyperplanes-with-centroid and occupied codes, as tensors."""
+        cached = self._partition_cache.get(library_name)
+        if cached is None:
+            planes, mean, signs = self.reservoir.partition_of(library_name)
+            cached = (
+                torch.as_tensor(planes, device=self.device),
+                torch.as_tensor(mean, device=self.device),
+                torch.as_tensor(signs, device=self.device),
+            )
+            self._partition_cache[library_name] = cached
+            self._bucket_rows[library_name] = self.reservoir.rows_of_buckets(
+                library_name
+            )
+        return cached
+
+    def _bucket_log_probs(
+        self, library_name: str, probe: torch.Tensor
+    ) -> tuple[torch.Tensor, NDArray[np.int64]]:
+        """log P(bucket | probe) over occupied buckets, and the argmax bucket.
+
+        The similarity is <code, hyperplane scores>, which is differentiable in the
+        probe and whose argmax over all codes is the hash code itself, so the bucket
+        this opens is the one the hash would have opened.
+        """
+        planes, mean, signs = self._partition(library_name)
+        unit = F.normalize(probe, dim=-1) - mean
+        scores = (unit @ planes.T) @ signs.T
+        chosen = scores.detach().argmax(dim=1)
+        temperature = self.hbs.temp_bucket.at(self.clock.value)
+        return F.log_softmax(scores / temperature, dim=1), chosen.cpu().numpy()
 
     def _probe_vector(self, projected: torch.Tensor) -> torch.Tensor:
         """The query as both scored and hashed, so the two cannot diverge."""
@@ -292,9 +276,8 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
     ) -> None:
         """Bits by which the jitter moved each probe's bucket code.
 
-        Measured within one call, between the same probes hashed with and without the
-        jitter -- not between successive calls, which involve different molecules and
-        would report state-to-state variation instead. At sigma 0 this is exactly 0.
+        Measured within one call, not between calls, which would report state-to-state
+        variation instead. Exactly 0 at sigma 0.
         """
         if self.hbs.noise_sigma <= 0:
             self.bits_flipped = 0.0
@@ -320,14 +303,11 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
     ) -> None:
         """Report whether the opened bucket actually holds the best rows.
 
-        Scored against the exact inner products in the same fixed space the index is
-        built in, so this measures the search and nothing else -- there is no stale
-        embedding to confound it, which was the whole point of fixing the features.
+        Scored against the exact inner products in the index's own space, so this
+        measures the search and nothing else.
         """
         scores = self.reservoir.exact_scores(library_name, probe)
-        # How close the probe sits to the fingerprints it is meant to retrieve. This
-        # is the question behind the whole design: the head has to learn to emit a
-        # direction in fingerprint space, and the hash can only help once it does.
+        # How close the probe sits to the fingerprints it is meant to retrieve.
         best_cosine = float(scores.max(axis=1).mean())
         mean_cosine = float(scores.mean())
         total = scores.shape[1]
@@ -341,10 +321,13 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
             hit_1 += int(order[0]) in opened
             hit_k += len(opened & set(order[:budget].tolist())) / budget
         count = len(candidates)
+        # Norm is 1 by construction when normalize_probe is on; when it is off this is
+        # the radial component the hash cannot see, so it reads the free gradient sink.
         logger.info(
             "HBS probe (library %s, N=%d, %d queries): best row in bucket %.1f%% "
             "(chance %.1f%%), its own top rows recalled %.1f%%, scanned %.0f of %d "
-            "rows (%.1f%%), probe-fingerprint cosine best %.4f / mean %.4f",
+            "rows (%.1f%%), probe-fingerprint cosine best %.4f / mean %.4f, "
+            "probe norm %.4f",
             library_name,
             total,
             count,
@@ -356,6 +339,7 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
             100 * scanned / count / total,
             best_cosine,
             mean_cosine,
+            float(np.linalg.norm(probe, axis=1).mean()),
         )
 
     # ======== Action distribution
@@ -413,10 +397,32 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
 
         # 2. Open each state's bucket, on one transfer of the group's probes.
         opened: list[dict[ActionKey, NDArray[np.int64]]] = [{} for _ in states]
+        row_weights: list[dict[ActionKey, NDArray[np.float32]]] = [{} for _ in states]
         union: dict[str, list[NDArray[np.int64]]] = {}
+        bucket_logp: list[dict[ActionKey, torch.Tensor]] = [{} for _ in states]
         for rows, _, _, spaces_by_action, _, probes in plans:
             keys = list(probes)
             if not keys:
+                continue
+            if self.hbs.hierarchical:
+                for key in keys:
+                    for subspace in spaces_by_action[key]:
+                        library_name = subspace.name[1]
+                        assert library_name is not None
+                        log_p, chosen = self._bucket_log_probs(
+                            library_name, probes[key]
+                        )
+                        buckets = self._bucket_rows[library_name]
+                        for local, state_i in enumerate(rows):
+                            candidates = buckets[chosen[local]]
+                            opened[state_i][subspace.name] = candidates
+                            row_weights[state_i][subspace.name] = np.zeros(
+                                len(candidates), dtype=np.float32
+                            )
+                            bucket_logp[state_i][subspace.name] = log_p[
+                                local, chosen[local]
+                            ]
+                            union.setdefault(library_name, []).append(candidates)
                 continue
             stacked = torch.cat([probes[key] for key in keys]).detach()
             on_cpu = stacked.to(torch.float32).cpu().numpy()
@@ -427,11 +433,31 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
                     library_name = subspace.name[1]
                     assert library_name is not None
                     found = self._lookup(library_name, probe)
-                    for local, state_i in enumerate(rows):
-                        opened[state_i][subspace.name] = found[local]
-                        union.setdefault(library_name, []).append(found[local])
+                    # Bucket alone, so the probe measures the hash and not the
+                    # uniform half.
                     if self._probe_due(library_name):
                         self._probe(library_name, probe, found)
+                    # One draw per (library, subspace, group), as upstream also
+                    # shares a draw; weights_for removes each state's own overlap.
+                    drawn = (
+                        self._complement.draw(
+                            library_name, self._uniform_k[library_name]
+                        )
+                        if self.hbs.hybrid
+                        else np.empty(0, dtype=np.int64)
+                    )
+                    for local, state_i in enumerate(rows):
+                        candidates, weights = self._complement.weights_for(
+                            library_name, found[local], drawn
+                        )
+                        opened[state_i][subspace.name] = candidates
+                        row_weights[state_i][subspace.name] = weights
+                        union.setdefault(library_name, []).append(candidates)
+
+        if self.hbs.hierarchical:
+            chosen_logp = [v for per_state in bucket_logp for v in per_state.values()]
+            if chosen_logp:
+                self.bucket_logp = -float(torch.stack(chosen_logp).mean().detach())
 
         # 3. Gather the fixed features of what this batch opened, once per library.
         rows_used = {
@@ -447,6 +473,7 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
         # 4. Score as upstream does -- one matrix product per action type against the
         # gathered rows -- then take each state's own columns out of that product.
         action_logits: list[list[ActionLogits]] = [[] for _ in states]
+        partition_weights: list[list[torch.Tensor]] = [[] for _ in states]
         for rows, indices, scale, spaces_by_action, queries, probes in plans:
             library_names = list(
                 dict.fromkeys(
@@ -477,7 +504,7 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
                     continue
                 libraries = [subspace.name[1] for subspace in spaces]
                 features = torch.cat([cache[name][0] for name in libraries])
-                logits = (probes[key] @ features.T) * scale
+                logits = (probes[key] @ features.T) * scale / self._row_temperature()
                 if apply_property_penalty:
                     mask = torch.cat([library_masks[name] for name in libraries], dim=1)
                     logits = logits.masked_fill(~mask, -torch.inf)
@@ -509,39 +536,54 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
                         )
 
             for local, state_i in enumerate(rows):
-                action_logits[state_i] = [
-                    ActionLogits(
-                        ActionSubspace(
-                            subspace.name,
-                            subspace.action_type,
-                            subspace.num_actions,
-                            opened[state_i][subspace.name],
+                entries: list[ActionLogits] = []
+                weights: list[torch.Tensor] = []
+                for subspace in base_spaces[state_i]:
+                    logits = group_logits[subspace.name][local]
+                    if subspace.name[1] is None:
+                        # Unimolecular: one action, always offered, no correction.
+                        entries.append(ActionLogits(subspace, logits))
+                        weights.append(torch.zeros(len(logits), device=self.device))
+                        continue
+                    entries.append(
+                        ActionLogits(
+                            ActionSubspace(
+                                subspace.name,
+                                subspace.action_type,
+                                subspace.num_actions,
+                                opened[state_i][subspace.name],
+                            ),
+                            logits,
                         )
-                        if subspace.name[1] is not None
-                        else subspace,
-                        group_logits[subspace.name][local],
                     )
-                    for subspace in base_spaces[state_i]
-                ]
+                    weight = torch.from_numpy(
+                        row_weights[state_i][subspace.name]
+                    ).to(self.device)
+                    if self.hbs.hierarchical and self.hbs.bucket_term == "partition":
+                        # Both sides carry it, so P_F stays normalized over the opened
+                        # set and the term only moves mass between subspaces.
+                        weight = weight + bucket_logp[state_i][subspace.name]
+                    weights.append(weight)
+                action_logits[state_i] = entries
+                partition_weights[state_i] = weights
 
-        # Candidate-set diversity is deliberately *not* recorded here. It answers
-        # "is the policy offered library-representative variety", which is a question
-        # about the baseline: a low value there means uniform subsampling handed the
-        # policy a poor slice to choose from. For retrieval a low value is the
-        # mechanism succeeding, not a defect, so the same number read across arms
-        # would invert. Retrieval quality is measured by _probe instead, against the
-        # exact inner products. Latency and route metrics are still collected for
-        # both arms, by the trainer, and are comparable.
-        return ActionCategorical(action_logits, self.subsampling)
+        # Candidate-set diversity is deliberately not recorded: for retrieval a low
+        # value is the mechanism working, so the number would invert across arms.
+        # _probe measures retrieval quality instead.
+        return WeightedActionCategorical(
+            action_logits,
+            self.subsampling,
+            partition_weights=partition_weights,
+            explore_temp=self.hbs.explore_temp,
+        )
 
     def get_action_logits(
         self, state_emb: torch.Tensor, actions: list[Action], logit_scale: torch.Tensor
     ) -> torch.Tensor:
         """Score the observed edges, which need not lie in any opened bucket.
 
-        The body is ``RxnFlowPolicy.get_action_logits`` with the synthon encoder
-        replaced by the fixed features, so a replayed or retrosynthesis-derived action
-        keeps a finite forward logit even when the current query would not retrieve it.
+        Upstream's body with the synthon encoder replaced by the fixed features, so a
+        replayed action keeps a finite forward logit.
         """
         by_reaction: dict[tuple[ActionType, str], list[int]] = {}
         by_library: dict[str, list[int]] = {}
@@ -571,6 +613,17 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
 
         logits = state_emb.new_zeros(len(actions))
         cosines: list[torch.Tensor] = []
+        # Which bucket holds each observed row: under P_F = P(bucket)P(row|bucket) the
+        # numerator is that bucket's log-probability, which for a replayed action need
+        # not be the one this query would open.
+        owning_bucket = {
+            row: self.reservoir.index[actions[row].library_name].row_bucket[
+                actions[row].synthon_index
+            ]
+            for rows in by_library.values()
+            for row in rows
+        } if self.hbs.hierarchical and self.hbs.bucket_term != "off" else {}
+        bucket_offset = state_emb.new_zeros(len(actions))
         for (action_type, action_name), rows in by_reaction.items():
             indices = torch.tensor(rows, device=self.device)
             emb = state_emb[indices]
@@ -584,6 +637,23 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
                     query = self.model.forward_birxn(emb, action_name, action_type)
                 probe = self._probe_vector(self.projection(query))
                 values = (probe * features[indices]).sum(1)
+                if owning_bucket:
+                    # Kept out of `values`: a log-probability must not be rescaled by
+                    # logit_scale or the row temperature, so it is added after those.
+                    for library_name in {actions[row].library_name for row in rows}:
+                        local = [
+                            i for i, row in enumerate(rows)
+                            if actions[row].library_name == library_name
+                        ]
+                        log_p, _ = self._bucket_log_probs(library_name, probe[local])
+                        picked = torch.tensor(
+                            [owning_bucket[rows[i]] for i in local], device=self.device
+                        )
+                        bucket_offset = bucket_offset.index_add(
+                            0,
+                            indices[local],
+                            log_p.gather(1, picked[:, None]).squeeze(1),
+                        )
                 with torch.no_grad():
                     # features are already unit-norm, so this is the cosine.
                     cosines.append(
@@ -592,7 +662,7 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
             logits = logits.index_copy(0, indices, values)
         if cosines:
             self.alignment = float(torch.cat(cosines).mean())
-        return logits * logit_scale
+        return logits * logit_scale / self._row_temperature() + bucket_offset
 
     # ======== Fixed features
 
@@ -601,10 +671,8 @@ class HBSPolicy(MetricsPolicyMixin, RxnFlowPolicy):
     ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Fixed features, properties and sizes for the given rows of each library.
 
-        The body is ``RxnFlowPolicy._get_synthon_cache`` with one line changed: where
-        upstream encodes the rows with the learned synthon encoder, this normalizes the
-        precomputed fingerprints. Nothing here carries gradients -- the reservoir is a
-        constant, and the only learned part of a synthon logit is the query projection.
+        ``_get_synthon_cache`` with the learned encoder replaced by the normalized
+        fingerprints. Nothing here carries gradient; only the query projection learns.
         """
         if not samples:
             return {}

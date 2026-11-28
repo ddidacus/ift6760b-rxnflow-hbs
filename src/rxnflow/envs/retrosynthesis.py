@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from collections.abc import Sequence
 from concurrent.futures import Future, ProcessPoolExecutor
 from typing import TYPE_CHECKING
 
@@ -9,7 +11,7 @@ from rdkit import Chem, rdBase
 
 from rxnflow.core.molecule import Molecule
 from rxnflow.core.synthon import typed_dummy_isotopes
-from rxnflow.core.types import Action, ActionType, BackwardTrajectory
+from rxnflow.core.types import Action, ActionType, BackwardEdge, BackwardTrajectory
 
 if TYPE_CHECKING:
     from rxnflow.core.reaction import BiReaction, UniReaction
@@ -98,6 +100,20 @@ class Worker:
         dfs = _RetroDFS(self, max_reactions, max_synthons, prune=self.prune)
         mol = Molecule(rdmol=rdmol)
         return dfs.run(mol, known_trajectories)
+
+    def one_step(self, smiles: str) -> list[BackwardEdge]:
+        """Single reverse steps from a state SMILES, in canonical order.
+
+        The result depends on the molecule alone (no budgets, pruning or recursion) and
+        the empty state "" has no parents. See `_RetroDFS.one_step`.
+        """
+        if not smiles:
+            return []
+        rdmol = Chem.MolFromSmiles(smiles)
+        if rdmol is None:
+            return []
+        dfs = _RetroDFS(self, self.max_reactions, self.max_synthons, prune=False)
+        return dfs.one_step(Molecule(rdmol=rdmol))
 
 
 class _RetroDFS:
@@ -275,11 +291,16 @@ class _RetroDFS:
         return trajectories
 
     def _reverse_birxn(
-        self, reaction: BiReaction, product: Molecule
+        self, reaction: BiReaction, product: Molecule, *, complete: bool = False
     ) -> list[tuple[Molecule, Molecule]]:
-        """Process catalog-supported precursor pairs in canonical DFS order."""
+        """Process catalog-supported precursor pairs in canonical DFS order.
+
+        `complete` proposes with the forward template's inverse instead of the curated
+        reverse template, so no split the forward reaction could have made is missed.
+        """
+        template = reaction.inverse_reaction if complete else reaction.reverse_reaction
         products = {}
-        for raw in reaction.reverse_reaction.RunReactants((product.rdmol,), 0):
+        for raw in template.RunReactants((product.rdmol,), 0):
             if len(raw) != 2 or typed_dummy_isotopes(raw[0]) != (reaction.state_type,):
                 continue
             sites = typed_dummy_isotopes(raw[1])
@@ -316,6 +337,109 @@ class _RetroDFS:
                 )
         return [products[key] for key in sorted(products)]
 
+    def one_step(self, molecule: Molecule) -> list[BackwardEdge]:
+        """Every single reverse step from `molecule`, without checking the parent.
+
+        Candidates are *proposed* by the inverse of each forward template and *kept*
+        only when the removed synthon is a catalog row and the forward reaction
+        reproduces the molecule. Proposing with the inverse rather than the curated
+        reverse template is what makes the set complete: the step that generated a
+        state is always among its candidates, so P_B can score it and a backward walk
+        can take it. `_dfs` keeps the curated reverse template, which encodes
+        retrosynthetic judgement and is RxnFlow's own heuristic.
+
+        There is no recursion, so a parent that cannot itself be built is still
+        returned (a dead end). A forward check that raises (ambiguous template)
+        rejects that candidate, matching what the forward step itself would do.
+        Edges come back in a canonical order, independent of generation order.
+        """
+        canonical = molecule.smiles
+        signature = typed_dummy_isotopes(molecule.rdmol)
+        edges: set[BackwardEdge] = set()
+
+        # 1. Direct FirstSynthon origin: the molecule is itself a catalog brick.
+        if len(signature) == 1:
+            library_name = str(signature[0])
+            if library_name in self.brick_types:
+                brick = Chem.Mol(molecule.rdmol)
+                for atom in brick.GetAtoms():
+                    if atom.GetAtomicNum() == 0:
+                        atom.SetIsotope(0)
+                synthon_index = self.synthon_search[library_name].get(
+                    Chem.MolToSmiles(brick)
+                )
+                if synthon_index is not None:
+                    action = Action(
+                        ActionType.FIRST_SYNTHON,
+                        library_name=library_name,
+                        synthon_index=synthon_index,
+                    )
+                    edges.add((action, ""))
+
+        # 2. Unimolecular reverses, each verified forward.
+        for _, reaction, action in self.uni_candidates.get(signature, ()):
+            for products in reaction.run_inverse(molecule):
+                if len(products) != 1:
+                    continue
+                precursor = products[0]
+                if typed_dummy_isotopes(precursor.rdmol) != (reaction.input_type,):
+                    continue
+                if _forward_reproduces(reaction, canonical, precursor):
+                    edges.add((action, precursor.smiles))
+
+        # 3. Bimolecular reverses: recover the oriented synthon and its catalog row.
+        for name, reaction in self.bi_candidates.get(signature, ()):
+            for child, synthon in self._reverse_birxn(reaction, molecule, complete=True):
+                if typed_dummy_isotopes(child.rdmol) != (reaction.state_type,):
+                    continue
+                synthon_sites = typed_dummy_isotopes(synthon.rdmol)
+                if not synthon_sites or synthon_sites[0] != 0:
+                    continue
+                library_name = "-".join(
+                    map(str, (reaction.attachment_type, *synthon_sites[1:]))
+                )
+                if (name, library_name) not in self.bi_actions:
+                    continue
+                library = self.synthon_search.get(library_name)
+                if library is None:
+                    continue
+                synthon_index = library.get(synthon.smiles)
+                if synthon_index is None:
+                    continue
+                if not _forward_reproduces(reaction, canonical, child, synthon):
+                    continue
+                action = Action(
+                    ActionType.BIRXN_BRICK
+                    if len(synthon_sites) == 1
+                    else ActionType.BIRXN_LINKER,
+                    reaction=name,
+                    library_name=library_name,
+                    synthon_index=synthon_index,
+                )
+                edges.add((action, child.smiles))
+        return sorted(edges, key=_edge_key)
+
+
+def _edge_key(edge: BackwardEdge) -> tuple:
+    """Total order over edges, so cached candidate lists are canonical."""
+    action, parent = edge
+    return (
+        int(action.action_type),
+        action.reaction or "",
+        action.library_name or "",
+        -1 if action.synthon_index is None else action.synthon_index,
+        parent,
+    )
+
+
+def _forward_reproduces(reaction, canonical: str, *reactants: Molecule) -> bool:
+    """True if running `reaction` forward on `reactants` gives the molecule `canonical`."""
+    try:
+        product = reaction.run_forward(*reactants)
+    except ValueError:  # ambiguous template: several distinct forward products
+        return False
+    return product is not None and product.smiles == canonical
+
 
 _WORKER: Worker | None = None
 
@@ -340,6 +464,11 @@ def _worker_run(
     )
 
 
+def _worker_one_step(smiles: str) -> list[BackwardEdge]:
+    assert _WORKER is not None
+    return _WORKER.one_step(smiles)
+
+
 class RetroSynthesisAnalyzer:
     """Find routes for external SMILES or generated states, locally or in workers.
 
@@ -347,10 +476,21 @@ class RetroSynthesisAnalyzer:
     per call.
     Results use reverse edge order, ending with FirstSynthon. Searches favor fewer
     synthons and do not enumerate every route within the limits.
+
+    `one_step_many` is separate: single reverse steps per molecule, cached by SMILES.
     """
 
-    def __init__(self, env: SynthesisEnv, workers: int = 0, prune: bool = True):
+    def __init__(
+        self,
+        env: SynthesisEnv,
+        workers: int = 0,
+        prune: bool = True,
+        one_step_cache_size: int = 200_000,
+    ):
         self.worker = Worker(env, prune=prune)
+        self._workers = workers
+        self._one_step_cache: OrderedDict[str, tuple[BackwardEdge, ...]] = OrderedDict()
+        self._one_step_cache_size = one_step_cache_size
         self.pool = (
             ProcessPoolExecutor(
                 max_workers=workers,
@@ -408,6 +548,37 @@ class RetroSynthesisAnalyzer:
                 _worker_run, smiles, max_reactions, known_trajectories, max_synthons
             )
             self.futures.append((key, future))
+
+    def one_step(self, smiles: str) -> tuple[BackwardEdge, ...]:
+        return self.one_step_many([smiles])[0]
+
+    def one_step_many(self, smiles_list: Sequence[str]) -> list[tuple[BackwardEdge, ...]]:
+        """Candidate reverse edges for each state, in canonical order.
+
+        Results are cached by SMILES (LRU) and misses are computed together, in the
+        worker pool when there is one. The returned tuples are shared with the cache.
+        """
+        cache = self._one_step_cache
+        found: dict[str, tuple[BackwardEdge, ...]] = {}
+        missing: list[str] = []
+        for smiles in dict.fromkeys(smiles_list):
+            hit = cache.get(smiles)
+            if hit is None:
+                missing.append(smiles)
+            else:
+                cache.move_to_end(smiles)
+                found[smiles] = hit
+        if missing:
+            if self.pool is None:
+                computed = [self.worker.one_step(smiles) for smiles in missing]
+            else:
+                chunk = max(1, len(missing) // (4 * self._workers))
+                computed = list(self.pool.map(_worker_one_step, missing, chunksize=chunk))
+            for smiles, edges in zip(missing, computed, strict=True):
+                found[smiles] = cache[smiles] = tuple(edges)
+            while len(cache) > self._one_step_cache_size:
+                cache.popitem(last=False)
+        return [found[smiles] for smiles in smiles_list]
 
     def result(self) -> list[tuple[int, list[BackwardTrajectory]]]:
         """Wait for pending searches and drain their results in submission order."""

@@ -1,0 +1,58 @@
+# RxnFlow on the roshambo2 target 'irak4_8ucc' (support/queries/irak4_8UCC_bioactive.sdf),
+# over the prepared 290k Enamine catalog.
+#
+# Why this target: it is one of the three most out-of-distribution queries of the
+# nine in support/queries, ranked by the Tanimoto of its *worst* BRICS fragment to
+# the nearest of the catalog's 377,706 unique synthons. A route has to supply every
+# fragment, so the bottleneck fragment decides reachability, not the average.
+#
+#   query heavy atoms   33
+#   BRICS fragments     4
+#   worst fragment      0.469
+#
+# The bottleneck is a fused imidazo-pyrimidine core carrying THREE attachment points, so a route must converge three bond-forming steps on one scaffold while averaging only 3.3-3.9 steps in total.
+#
+# Whole-molecule similarity to synthons is deliberately not used for this ranking:
+# it sits at 0.27-0.48 for all nine queries simply because synthons are ~11 heavy
+# atoms and these are 25-37 atom ligands, so it does not separate them.
+#
+# Caveat carried from that analysis: BRICS cuts approximate synthetic routes but are
+# not this environment's reaction templates, and roshambo2 scores 3D shape and colour
+# overlap rather than 2D similarity -- a fragment-OOD target can still pick up a
+# decent score from a different scaffold that fills the same volume. So this config
+# tests a hard target, not a provably unreachable one.
+#
+# Used by both arms -- uniform action subsampling and CAS -- so a pair of runs here
+# shares every setting below and differs only in --cas.
+env_dir: ./data/envs/enamine_290k/
+
+reward:
+  # Matches hbs/configs/cdk8_enamine.yaml exactly apart from the target, so these
+  # runs are on the same scale as the CDK8 ones and as the published REINVENT /
+  # Augmented Hill Climbing / NuevaMol numbers.
+  beta: "32"
+  settings:
+    kind: roshambo2
+    target: irak4_8ucc
+    num_confs: 25
+    num_isomers: 2
+    # n_jobs is left to ROSHAMBO_NUM_CPUS; see hbs/sbatch/train_roshambo_hard.sh.
+
+# Unchanged from the CDK8 and PMO configs: 255 of 388 libraries are subsampled and
+# 55,314 of 482,070 candidate actions are scored per state (11.5%). Keeping it fixed
+# is what makes the uniform arm here the same estimator as in every other comparison.
+subsampling:
+  sampling_ratio: 0.1
+  min_sampling: 50
+  importance_temp: 1.0
+
+# As in the CDK8 configs. The PMO configs omit it because PMO scores a molecule by
+# its oracle alone; a shape objective has no size term of its own, so without this a
+# run is free to inflate shape overlap by growing the molecule.
+property_penalty:
+  mw: 500
+
+training:
+  # 500 steps is the whole budget here (no max_oracle_calls, unlike the PMO configs),
+  # so a preemption without a checkpoint is expensive. Checkpoints are ~72MB.
+  checkpoint_every: 100

@@ -1,0 +1,41 @@
+# RxnFlow on the PMO task `zaleplon_mpo`.
+#
+# Chosen as a task that does not saturate: best PMO methods reach ~0.4 AUC; mean 0.055 / max 0.400 -- the hardest of the three chosen, kept because its range is still usable.
+# Everything else matches hbs/configs/pmo_jnk3.yaml so the arms stay
+# comparable across tasks.
+env_dir: ./data/envs/enamine_290k/
+
+reward:
+  # Reward exponent. 32 is the shipped single-objective default (configs/qed.yaml);
+  # every PMO task scores in [0, 1], the same scale as QED and roshambo2.
+  beta: "32"
+  settings:
+    kind: pmo
+    task: zaleplon_mpo
+    # The run ends when this is spent, so --steps only has to be large enough
+    # not to end it first. PMO publishes 10000; 50000 is used here because a
+    # synthesis-constrained generator starts from a much smaller reachable set
+    # than the unconstrained baselines PMO tabulates, and because AUC top-10 is
+    # normalised by the budget and so stays readable at any budget. Drop it to
+    # 10000 for a number directly comparable with the published table.
+    max_oracle_calls: 50000
+
+# Deliberately no property_penalty, unlike the CDK8 configs: PMO scores a molecule
+# by its oracle alone. With none set and one objective, the 'reward' recorded per
+# molecule *is* the oracle score, which is what hbs/analyze.py integrates into
+# AUC top-10 -- the benchmark's headline metric.
+
+# The same subsampling as hbs/configs/cdk8_enamine.yaml, so a PMO pair and a CDK8
+# pair are mechanistically comparable: on this catalog it subsamples 255 of 388
+# libraries and scores 55,314 of 482,070 candidate actions per state (11.5%).
+subsampling:
+  sampling_ratio: 0.1
+  min_sampling: 50
+  importance_temp: 1.0
+
+training:
+  # A 50,000-call budget takes 800-2,200 steps, depending on how much of each
+  # batch is a molecule already scored. Checkpoints are ~72MB and are never
+  # pruned, so every 200 steps -- as in cdk8_enamine_seeds.yaml -- keeps a
+  # preemption cheap without writing gigabytes per run.
+  checkpoint_every: 200
